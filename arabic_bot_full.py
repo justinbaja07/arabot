@@ -980,93 +980,114 @@ async def cmd_seed_titles(interaction: discord.Interaction):
 # --------------------
 # END OF QUADRANT 3
 # --------------------
-# allow command processing first for slash commands etc.
-try:
+
+# --------------------
+# QUADRANT 4
+# --------------------
+
+# ------------------------------------------------------------
+# on_message event — final challenge handling & command routing
+# ------------------------------------------------------------
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore own messages
+    if message.author.bot:
+        return
+
+    # We'll let slash commands process if it's a slash invocation
+    # but also provide text-cmd fallback for older setups any channel
+    # However, the main logic is the challenge check.
     user_id = message.author.id
     guild_id = message.guild.id if message.guild else None
-except Exception:
+
+    # If there is an active challenge, we handle the user’s *first* text message.
+    if user_id in active_challenges:
+        chal = active_challenges.get(user_id)
+        struggle_id = chal.get("struggle_id")
+        correct_definition = chal.get("definition")
+        word = chal.get("word")
+
+        # digital only: if user sends empty message, continue processing
+        user_answer = message.content.strip()
+        if not user_answer:
+            await bot.process_commands(message)
+            return
+
+        # evaluate off-thread
+        try:
+            sim = await evaluate_answer_async(user_answer, struggle_id)
+        except Exception:
+            # embedding/light error => close challenge
+            try:
+                await message.channel.send(
+                    "⚠️ Error scoring your answer. Please try `/challenge` again."
+                )
+            except Exception:
+                pass
+            active_challenges.pop(user_id, None)
+            await bot.process_commands(message)
+            return
+
+        # Log attempt
+        try:
+            log_challenge_attempt(guild_id, user_id, struggle_id)
+        except Exception:
+            pass
+
+        if sim >= CHALLENGE_SIMILARITY_THRESHOLD:
+            # correct
+            try:
+                add_points(guild_id, user_id, POINTS_FOR_CORRECT)
+            except Exception:
+                pass
+
+            active_challenges.pop(user_id, None)
+
+            try:
+                await message.channel.send(
+                    f"🔥 **Correct!** You earned **{POINTS_FOR_CORRECT} points** for **{word}**.\n"
+                    f"Similarity score: `{sim:.2f}`"
+                )
+            except Exception:
+                pass
+        else:
+            # wrong
+            try:
+                await message.channel.send(
+                    f"❌ Not quite. The correct definition was:\n\n"
+                    f"`{correct_definition}`\n\n"
+                    f"Similarity score: `{sim:.2f}`\n\n"
+                    f"Try `/challenge` again for a new attempt."
+                )
+            except Exception:
+                pass
+
+            active_challenges.pop(user_id, None)
+
+        # done — do not treat this as a command
+        return
+
+    # Otherwise, process commands normally
     await bot.process_commands(message)
-    return
 
-# If there is an active challenge for this user, only accept their message
-if user_id in active_challenges:
-    chal = active_challenges.get(user_id)
-    struggle_id = chal.get("struggle_id")
-    correct_definition = chal.get("definition")
-    word = chal.get("word")
 
-    # We'll only accept the first non-empty message as the one attempt
-    user_answer = message.content.strip()
-    if not user_answer:
-        # ignore empty content messages
-        await bot.process_commands(message)
-        return
-
-    # Compute similarity off the event loop
+# ------------------------------------------------------------
+# On Ready — sync slash commands and startup tasks
+# ------------------------------------------------------------
+@bot.event
+async def on_ready():
+    print(f"🟢 Logged in as {bot.user} (ID: {bot.user.id})")
     try:
-        sim = await evaluate_answer_async(user_answer, struggle_id)
+        synced = await tree.sync()
+        print(f"🔧 Synced {len(synced)} slash commands.")
     except Exception as e:
-        # In case of embedding errors, inform user and close the challenge to avoid stuck state
-        try:
-            await message.channel.send("⚠️ An error occurred while scoring your answer. Please try /challenge again.")
-        except Exception:
-            pass
-        # remove active challenge
-        try:
-            del active_challenges[user_id]
-        except KeyError:
-            pass
-        await bot.process_commands(message)
-        return
+        print("Slash command sync failed:", e)
 
-    # Mark attempt in history (already logged when issued, but log the attempt too)
-    try:
-        log_challenge_attempt(guild_id, user_id, struggle_id)
-    except Exception:
-        pass
+    # You can add any other startup tasks here
 
-    # Check threshold
-    if sim >= CHALLENGE_SIMILARITY_THRESHOLD:
-        # correct
-        try:
-            add_points(guild_id, user_id, POINTS_FOR_CORRECT)
-        except Exception:
-            pass
 
-        # remove active challenge
-        try:
-            del active_challenges[user_id]
-        except KeyError:
-            pass
-
-        # Inform user
-        try:
-            await message.channel.send(
-                f"🔥 **Correct!** You earned **{POINTS_FOR_CORRECT} points** for **{word}**.\n"
-                f"Similarity score: `{sim:.2f}`"
-            )
-        except Exception:
-            pass
-    else:
-        # wrong — reveal and close challenge immediately
-        try:
-            await message.channel.send(
-                f"❌ Not quite. The correct definition was:\n\n`{correct_definition}`\n\n"
-                f"Similarity score: `{sim:.2f}`\n\n"
-                f"To try again, run `/challenge` (you will get a fresh attempt)."
-            )
-        except Exception:
-            pass
-
-        # remove active challenge
-        try:
-            del active_challenges[user_id]
-        except KeyError:
-            pass
-
-    # Do not process this message as a command further (we handled it)
-    return
-
-# If no active challenge or message isn't relevant, allow commands to be processed
-await bot.process_commands(message)
-
+# ------------------------------------------------------------
+# BOT STARTUP
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)
