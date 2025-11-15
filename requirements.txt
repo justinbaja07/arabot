@@ -1,12 +1,15 @@
 discord.py==2.3.2
 python-dotenv==1.0.1
 
-# AI + ML
-torch==2.1.2
+# Lightweight CPU torch wheel
+torch==2.2.0+cpu
+torchvision==0.17.0+cpu
+torchaudio==2.2.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 sentence-transformers==2.2.2
-scikit-learn==1.4.0
+scikit-learn==1.3.2
 numpy==1.26.4
 
-# HTTP dependencies (discord library requires these)
 aiohttp==3.9.1
 requests==2.31.0
