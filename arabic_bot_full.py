@@ -1,22 +1,33 @@
+# ---------------------------
+# arabic_bot_full.py - Part 1
+# ---------------------------
+
 import os
 import sqlite3
 import asyncio
+import random
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
 
 import discord
-from discord import app_commands
+from discord import app_commands, ui
 from discord.ext import tasks, commands
+
+# Embedding / ML
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 TIMEZONE = ZoneInfo("America/Chicago")
 REMINDER_HOUR = 12  # 12:00 PM CST
 REMINDER_MINUTE = 0
-GUILD_ID = 1438553047344353293
+GUILD_ID = 1438553047344353293  # set to your guild id or None to run everywhere
 # ----------------------------------------
 
+# ---------- Intents and Bot ----------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -24,11 +35,15 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ---------- Database setup ----------
+# ---------- Database connection ----------
 DB = "arabic_bot.db"
 conn = sqlite3.connect(DB, check_same_thread=False)
 c = conn.cursor()
 
+# --------------------
+# TABLE CREATION
+# --------------------
+# Existing core tables
 c.execute("""
 CREATE TABLE IF NOT EXISTS completions (
     id INTEGER PRIMARY KEY,
@@ -39,6 +54,7 @@ CREATE TABLE IF NOT EXISTS completions (
     time TEXT
 )
 """)
+
 c.execute("""
 CREATE TABLE IF NOT EXISTS streaks (
     guild_id INTEGER,
@@ -50,6 +66,7 @@ CREATE TABLE IF NOT EXISTS streaks (
     PRIMARY KEY (guild_id, user_id)
 )
 """)
+
 c.execute("""
 CREATE TABLE IF NOT EXISTS settings (
     guild_id INTEGER PRIMARY KEY,
@@ -59,9 +76,66 @@ CREATE TABLE IF NOT EXISTS settings (
     last_reminder_date TEXT
 )
 """)
+
+# New gamification tables
+c.execute("""
+CREATE TABLE IF NOT EXISTS struggle_words (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    user_id INTEGER,
+    word TEXT,
+    definition TEXT,
+    UNIQUE(guild_id, user_id, word)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS struggle_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    struggle_id INTEGER,
+    embedding BLOB
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS points (
+    guild_id INTEGER,
+    user_id INTEGER,
+    points INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS titles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    color TEXT,
+    price INTEGER
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_titles (
+    guild_id INTEGER,
+    user_id INTEGER,
+    title_id INTEGER,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
 conn.commit()
 
-# ---------- Helpers ----------
+# --------------------
+# EMBEDDING MODEL LOAD
+# --------------------
+# Load once at module import (small model)
+# Note: this may increase cold-start time but avoids repeated loads.
+embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# --------------------
+# BASIC HELPERS
+# --------------------
 def now_cst():
     return datetime.now(TIMEZONE)
 
@@ -71,6 +145,7 @@ def today_cst_str():
 def yesterday_cst_str():
     return (now_cst().date() - timedelta(days=1)).isoformat()
 
+# ---- Settings helpers (unchanged semantics) ----
 def get_settings(guild_id: int):
     c.execute("SELECT channel_id, ping_role_id, ping_enabled, last_reminder_date FROM settings WHERE guild_id = ?", (guild_id,))
     row = c.fetchone()
@@ -95,6 +170,7 @@ def upsert_settings(guild_id: int, **kwargs):
         c.execute("UPDATE settings SET last_reminder_date = ? WHERE guild_id = ?", (kwargs["last_reminder_date"], guild_id))
     conn.commit()
 
+# ---- Completions & streak helpers (kept from original) ----
 def record_completion(guild_id: int, user: discord.Member, date_str: str, time_str: str):
     c.execute("SELECT 1 FROM completions WHERE guild_id = ? AND user_id = ? AND date = ?", (guild_id, user.id, date_str))
     if c.fetchone():
@@ -136,7 +212,7 @@ def get_user_streak(guild_id: int, user_id: int):
         return {"streak": row[0], "last_done_date": row[1], "total": row[2]}
     return {"streak": 0, "last_done_date": None, "total": 0}
 
-def get_leaderboard(guild_id: int, limit=10):
+def get_leaderboard_streaks(guild_id: int, limit=10):
     c.execute("""
         SELECT username, streak, total_completions FROM streaks
         WHERE guild_id = ?
@@ -169,308 +245,627 @@ def reset_streaks_for_missed_yesterday(guild: discord.Guild):
     conn.commit()
     return missed
 
-# =====================================================
-# Reminder UI
-# =====================================================
-from discord import ui
+# --------------------
+# END OF QUADRANT 1
+# --------------------
 
-WAS_ASLEEP = False  # (unused now but preserved for minimal-change request)
+# ---------------------------
+# arabic_bot_full.py - Part 2
+# ---------------------------
 
-def build_reminder_embed(guild: discord.Guild, triggered_by: str = "scheduled") -> discord.Embed:
-    today = today_cst_str()
-    done_rows = get_today_completions(guild.id)
-    lb = get_leaderboard(guild.id, limit=5)
+# ----------------------------------------
+# STRUGGLE WORD HELPERS
+# ----------------------------------------
 
-    embed = discord.Embed(title="⏰ Arabic Reminder", color=0x2ECC71)
-    embed.set_footer(text=f"Trigger: {triggered_by} • {today} CST")
+def embed_text(text: str) -> bytes:
+    """Generate embedding bytes from text."""
+    vec = embedding_model.encode(text)
+    arr = np.asarray(vec, dtype=np.float32)
+    return arr.tobytes()
 
-    if done_rows:
-        name_col = "Name"
-        time_col = "Time"
-        rows = [(r[0], r[1]) for r in done_rows]
-        name_w = max(len(name_col), *(len(r[0]) for r in rows))
-        time_w = max(len(time_col), *(len(r[1]) for r in rows))
-        lines = [
-            f"{name_col.ljust(name_w)} | {time_col.ljust(time_w)}",
-            f"{'-'*name_w}-+-{'-'*time_w}"
-        ]
-        for name, t in rows:
-            lines.append(f"{name.ljust(name_w)} | {t.ljust(time_w)}")
-        table = "```\n" + "\n".join(lines) + "\n```"
-        embed.add_field(name="✅ Today's Completions", value=table, inline=False)
-    else:
-        embed.add_field(name="✅ Today's Completions", value="No completions yet today. Be the first! ✨", inline=False)
+def get_embedding_array(blob: bytes) -> np.ndarray:
+    """Convert stored blob back to array."""
+    return np.frombuffer(blob, dtype=np.float32)
 
-    if lb:
-        medals = ["🥇", "🥈", "🥉"]
-        lb_lines = []
-        for i, (username, streak, total) in enumerate(lb):
-            medal = medals[i] if i < 3 else f"{i+1}."
-            lb_lines.append(f"{medal} {username} — Streak: {streak} | Total: {total}")
-        embed.add_field(name="🏆 Top Streaks", value="\n".join(lb_lines), inline=False)
-    else:
-        embed.add_field(name="🏆 Top Streaks", value="No streak data yet.", inline=False)
-
-    embed.description = "Click the button below to mark today's Arabic done — it works just like `/done`."
-    return embed
-
-class ReminderView(ui.View):
-    def __init__(self, guild: discord.Guild, *, timeout: Optional[float] = 3600):
-        super().__init__(timeout=timeout)
-        self.guild = guild
-
-    @ui.button(label="Mark Arabic Done (today)", style=discord.ButtonStyle.primary)
-    async def mark_done(self, interaction: discord.Interaction, button: ui.Button):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("This button can only be used in a server.", ephemeral=True)
-            return
-
-        date_str = today_cst_str()
-        time_str = now_cst().time().strftime("%H:%M:%S")
-        success = record_completion(guild.id, interaction.user, date_str, time_str)
-        if not success:
-            await interaction.response.send_message("You already marked done today.", ephemeral=True)
-            return
-
-        try:
-            new_embed = build_reminder_embed(guild, triggered_by="interactive")
-            if interaction.message:
-                await interaction.message.edit(embed=new_embed, view=self)
-        except Exception:
-            pass
-
-        await interaction.response.send_message(f"Marked done at {time_str} CST. Nice!", ephemeral=True)
-
-async def send_reminder_message(guild: discord.Guild, triggered_by: str = "scheduled"):
-    settings = get_settings(guild.id)
-    channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
-    if not channel:
-        return None
-
-    msg_text = None
-    if settings.get("ping_enabled") and settings.get("ping_role_id"):
-        role = guild.get_role(settings.get("ping_role_id"))
-        if role:
-            msg_text = f"{role.mention} Have you done Arabic yet?"
-
-    embed = build_reminder_embed(guild, triggered_by=triggered_by)
-    view = ReminderView(guild)
+def add_struggle_word(guild_id: int, user_id: int, word: str, definition: str):
+    """Insert a struggle word + its embedding."""
     try:
-        if msg_text:
-            return await channel.send(content=msg_text, embed=embed, view=view)
-        else:
-            return await channel.send(embed=embed, view=view)
-    except Exception:
-        return None
+        c.execute("""
+            INSERT INTO struggle_words (guild_id, user_id, word, definition)
+            VALUES (?, ?, ?, ?)
+        """, (guild_id, user_id, word.lower(), definition.lower()))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return False
 
-# ========== Slash Commands ==========
-@tree.command(name="done", description="Mark today's Arabic lesson as done.")
-async def slash_done(interaction: discord.Interaction):
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("Use this in a server channel.", ephemeral=True)
-        return
-    date_str = today_cst_str()
-    time_str = now_cst().time().strftime("%H:%M:%S")
-    success = record_completion(guild.id, interaction.user, date_str, time_str)
-    if not success:
-        await interaction.response.send_message("You already marked done today.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"Marked done at {time_str} CST. Nice!", ephemeral=True)
-
-@tree.command(name="undone", description="Undo your Arabic lesson for today if you marked it done.")
-async def slash_undone(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
-
-    user = interaction.user
-    date_str = today_cst_str()
-
-    c.execute("SELECT 1 FROM completions WHERE guild_id = ? AND user_id = ? AND date = ?", (guild.id, user.id, date_str))
-    if not c.fetchone():
-        await interaction.response.send_message("You never marked done today.", ephemeral=True)
-        return
-
-    c.execute("DELETE FROM completions WHERE guild_id = ? AND user_id = ? AND date = ?", (guild.id, user.id, date_str))
-    c.execute("SELECT streak, total_completions FROM streaks WHERE guild_id = ? AND user_id = ?", (guild.id, user.id))
-    row = c.fetchone()
-    if row:
-        streak = max(0, row[0] - 1)
-        total = max(0, row[1] - 1)
-        c.execute("UPDATE streaks SET streak = ?, total_completions = ? WHERE guild_id = ? AND user_id = ?", (streak, total, guild.id, user.id))
+    # Insert embedding
+    struggle_id = c.lastrowid
+    emb = embed_text(definition)
+    c.execute("""
+        INSERT INTO struggle_embeddings (struggle_id, embedding)
+        VALUES (?, ?)
+    """, (struggle_id, emb))
     conn.commit()
-    await interaction.response.send_message(f"{user.mention}, your completion for today has been undone. Streak adjusted.", ephemeral=True)
+    return True
 
-@tree.command(name="stats", description="Show a user's streak and totals. Use without mention to see your own.")
-@app_commands.describe(member="The member to view (optional)")
-async def slash_stats(interaction: discord.Interaction, member: discord.Member = None):
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("Use in server.", ephemeral=True)
-        return
-    if member is None:
-        member = interaction.user
-    s = get_user_streak(guild.id, member.id)
-    await interaction.response.send_message(f"{member.mention} — streak: {s['streak']}, last done: {s['last_done_date']}, total completions: {s['total']}")
+def remove_struggle_word(guild_id: int, user_id: int, word: str):
+    """Remove struggle word."""
+    c.execute("""
+        SELECT id FROM struggle_words
+        WHERE guild_id = ? AND user_id = ? AND word = ?
+    """, (guild_id, user_id, word.lower()))
+    row = c.fetchone()
+    if not row:
+        return False
 
-@tree.command(name="reminder", description="Send today's Arabic reminder immediately (for testing).")
-async def slash_reminder(interaction: discord.Interaction):
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("Use this command in a server channel.", ephemeral=True)
-        return
+    struggle_id = row[0]
+    c.execute("DELETE FROM struggle_embeddings WHERE struggle_id = ?", (struggle_id,))
+    c.execute("DELETE FROM struggle_words WHERE id = ?", (struggle_id,))
+    conn.commit()
+    return True
 
+def get_user_struggle_words(guild_id: int, user_id: int):
+    c.execute("""
+        SELECT id, word, definition FROM struggle_words
+        WHERE guild_id = ? AND user_id = ?
+    """, (guild_id, user_id))
+    return c.fetchall()
+
+def get_random_struggle_word(guild_id: int, user_id: int):
+    rows = get_user_struggle_words(guild_id, user_id)
+    return random.choice(rows) if rows else None
+
+def evaluate_answer(user_answer: str, correct_definition: str, struggle_id: int):
+    """
+    Compare embeddings of the correct definition vs. user's answer.
+    Returns similarity (0 to ~1).
+    """
+    # Fetch stored embedding
+    c.execute("SELECT embedding FROM struggle_embeddings WHERE struggle_id = ?", (struggle_id,))
+    row = c.fetchone()
+    if not row:
+        return 0.0
+
+    stored_vec = get_embedding_array(row[0])
+
+    # Embed user's answer
+    ans_vec = embedding_model.encode(user_answer)
+    ans_vec = np.asarray(ans_vec, dtype=np.float32)
+
+    sim = cosine_similarity([stored_vec], [ans_vec])[0][0]
+
+    return sim
+
+async def send_reminder_message(guild: discord.Guild):
     settings = get_settings(guild.id)
-    channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
-    if channel is None:
-        await interaction.response.send_message("No channel set and no system channel found.", ephemeral=True)
+    channel_id = settings.get("channel_id")
+    ping_role_id = settings.get("ping_role_id")
+    ping_enabled = settings.get("ping_enabled")
+
+    if not channel_id:
         return
 
-    sent = await send_reminder_message(guild, triggered_by="manual")
-    if sent:
-        upsert_settings(guild.id, last_reminder_date=today_cst_str())
-        await interaction.response.send_message(f"Reminder sent to {channel.mention}", ephemeral=True)
-    else:
-        await interaction.response.send_message("Failed to send reminder. Check bot permissions and channel settings.", ephemeral=True)
-
-@tree.command(name="summary", description="Send today's Arabic summary immediately (for testing).")
-async def slash_summary(interaction: discord.Interaction):
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("Use this command in a server channel.", ephemeral=True)
-        return
-
-    embed = await send_summary_embed(guild)
-    await interaction.response.send_message(f"Summary sent!", ephemeral=True)
-
-@tree.command(name="leaderboard", description="Show top streaks for Arabic lessons.")
-async def slash_leaderboard(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        await interaction.response.send_message("Use in server.", ephemeral=True)
-        return
-
-    top = get_leaderboard(guild.id, limit=10)
-    if not top:
-        await interaction.response.send_message("No data yet.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="🏆 Arabic Streak Leaderboard", color=0xffd700)
-    leaderboard_text = ""
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (username, streak, total) in enumerate(top):
-        medal = medals[i] if i < 3 else f"{i+1}."
-        leaderboard_text += f"{medal} {username} | Streak: {streak} | Total: {total}\n"
-
-    embed.description = leaderboard_text
-    await interaction.response.send_message(embed=embed)
-
-# ---------- Summary embed ----------
-async def send_summary_embed(guild: discord.Guild):
-    settings = get_settings(guild.id)
-    channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
+    channel = guild.get_channel(channel_id)
     if not channel:
-        return "No channel set."
+        return
 
-    yesterday = yesterday_cst_str()
-    c.execute("SELECT username, time FROM completions WHERE guild_id = ? AND date = ?", (guild.id, yesterday))
-    done_rows = c.fetchall()
-    done_usernames = {r[0] for r in done_rows}
+    role_txt = f"<@&{ping_role_id}>" if (ping_enabled and ping_role_id) else ""
 
-    tracked = []
-    if settings.get("ping_role_id"):
-        role = guild.get_role(settings.get("ping_role_id"))
-        if role:
-            tracked = [m for m in role.members if not m.bot]
+    embed = discord.Embed(
+        title="📘 Daily Arabic Reminder",
+        description="Don't forget to do your Arabic today!",
+        color=0x00B2FF
+    )
+
+    await channel.send(content=role_txt, embed=embed)
+
+
+async def send_summary_embed(guild: discord.Guild):
+    rows = get_today_completions(guild.id)
+
+    embed = discord.Embed(
+        title="🌙 Daily Summary",
+        description="Here’s who completed their Arabic today.",
+        color=0xFFD700
+    )
+
+    if rows:
+        for username, t in rows:
+            embed.add_field(name=username, value=f"Completed at {t}", inline=False)
     else:
-        tracked = [m for m in guild.members if not m.bot]
+        embed.add_field(name="Nobody completed today 😭", value="Try again tomorrow!", inline=False)
 
-    not_done = [m for m in tracked if str(m) not in done_usernames]
+    settings = get_settings(guild.id)
+    channel_id = settings.get("channel_id")
+    if not channel_id:
+        return
 
-    embed = discord.Embed(title=f"📊 Yesterday's Arabic Progress - {yesterday}", color=0x00ff00)
-    if done_rows:
-        done_text = ""
-        for username, time_done in done_rows:
-            c.execute("SELECT streak, total_completions FROM streaks WHERE guild_id = ? AND username = ?", (guild.id, username))
-            row = c.fetchone()
-            streak = row[0] if row else 0
-            total = row[1] if row else 0
-            done_text += f"- {username} | {time_done} | Streak: {streak} | Total: {total}\n"
-        embed.add_field(name="✅ Done Yesterday", value=done_text, inline=False)
-    else:
-        embed.add_field(name="✅ Done Yesterday", value="No one did Arabic yesterday!", inline=False)
-
-    if not_done:
-        not_done_text = "\n".join(f"- {m.mention}" for m in not_done)
-        embed.add_field(name="❌ Not Done", value=not_done_text, inline=False)
-    else:
-        embed.add_field(name="❌ Not Done", value="Everyone did Arabic yesterday! 🎉", inline=False)
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
 
     await channel.send(embed=embed)
-    return embed
 
-# ---------- Background tasks ----------
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (id {bot.user.id})")
+
+
+
+# ----------------------------------------
+# POINTS SYSTEM
+# ----------------------------------------
+
+def add_points(guild_id: int, user_id: int, amount: int):
+    c.execute("""
+        INSERT INTO points (guild_id, user_id, points)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET points = points + EXCLUDED.points
+    """, (guild_id, user_id, amount))
+    conn.commit()
+
+def get_points(guild_id: int, user_id: int):
+    c.execute("SELECT points FROM points WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+
+# ----------------------------------------
+# TITLES SYSTEM
+# ----------------------------------------
+
+def create_title(name: str, color: str, price: int):
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            await tree.sync(guild=guild)
-        else:
-            await tree.sync()
-        print("Slash commands synced.")
+        c.execute("""
+            INSERT INTO titles (name, color, price)
+            VALUES (?, ?, ?)
+        """, (name, color, price))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def list_titles():
+    c.execute("SELECT id, name, color, price FROM titles ORDER BY price ASC")
+    return c.fetchall()
+
+def get_user_title(guild_id: int, user_id: int):
+    c.execute("""
+        SELECT titles.name, titles.color FROM user_titles
+        JOIN titles ON user_titles.title_id = titles.id
+        WHERE guild_id = ? AND user_id = ?
+    """, (guild_id, user_id))
+    return c.fetchone()
+
+def purchase_title(guild_id: int, user_id: int, title_id: int):
+    # Get title price
+    c.execute("SELECT price FROM titles WHERE id = ?", (title_id,))
+    row = c.fetchone()
+    if not row:
+        return "NO_TITLE"
+
+    price = row[0]
+    user_pts = get_points(guild_id, user_id)
+
+    if user_pts < price:
+        return "NO_POINTS"
+
+    # Deduct points
+    c.execute("UPDATE points SET points = points - ? WHERE guild_id = ? AND user_id = ?",
+              (price, guild_id, user_id))
+
+    # Assign title
+    c.execute("""
+        INSERT OR REPLACE INTO user_titles (guild_id, user_id, title_id)
+        VALUES (?, ?, ?)
+    """, (guild_id, user_id, title_id))
+
+    conn.commit()
+    return "OK"
+
+
+# ----------------------------------------
+# AUTO COLOR ROLE SYSTEM
+# ----------------------------------------
+
+async def apply_title_color(member: discord.Member, color_hex: str, title_name: str):
+    """
+    Creates/gets a role with the correct title & color and applies it to the user.
+    """
+    guild = member.guild
+    color_int = int(color_hex.lstrip("#"), 16)
+
+    # Check if role exists
+    role = discord.utils.get(guild.roles, name=f"[{title_name}]")
+    if role is None:
+        role = await guild.create_role(
+            name=f"[{title_name}]",
+            colour=discord.Colour(color_int),
+            reason="Title purchase"
+        )
+
+    # Remove old title roles
+    for r in member.roles:
+        if r.name.startswith("[") and r.name.endswith("]"):
+            try:
+                await member.remove_roles(r)
+            except:
+                pass
+
+    # Give new one
+    await member.add_roles(role)
+
+
+# --------------------
+# END OF QUADRANT 2
+# --------------------
+
+# ---------------------------
+# arabic_bot_full.py - Part 3
+# ---------------------------
+
+# ============================================================
+#                  SLASH COMMANDS START
+# ============================================================
+
+
+# ------------------------------------------------------------
+# /struggle add  |  /struggle remove  |  /struggle list
+# ------------------------------------------------------------
+
+@tree.command(name="struggle_add", description="Add a struggle word.")
+@app_commands.describe(word="The Arabic word", definition="The meaning/definition")
+async def struggle_add(interaction: discord.Interaction, word: str, definition: str):
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    ok = add_struggle_word(guild_id, user_id, word, definition)
+    if not ok:
+        await interaction.response.send_message(
+            f"❌ You already added **{word}**.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Added **{word}** → `{definition}` to your struggle list.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="struggle_remove", description="Remove a struggle word.")
+@app_commands.describe(word="Word to remove")
+async def struggle_remove(interaction: discord.Interaction, word: str):
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    ok = remove_struggle_word(guild_id, user_id, word)
+    if not ok:
+        await interaction.response.send_message(
+            f"❌ You don’t have **{word}** in your struggle words.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🗑️ Removed **{word}**.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="struggle_list", description="Show your struggle words.")
+async def struggle_list(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    rows = get_user_struggle_words(guild_id, user_id)
+    if not rows:
+        await interaction.response.send_message(
+            "You have **no** struggle words.",
+            ephemeral=True
+        )
+        return
+
+    msg = "**Your Struggle Words:**\n\n"
+    for _, word, definition in rows:
+        msg += f"• **{word}** → `{definition}`\n"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+
+# ------------------------------------------------------------
+# /challenge — gives a random struggle word & waits for answer
+# ------------------------------------------------------------
+
+active_challenges = {}  # key: user_id, value: (struggle_id, correct_def)
+
+@tree.command(name="challenge", description="Get quizzed on one of your struggle words.")
+async def challenge(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    row = get_random_struggle_word(guild_id, user_id)
+    if not row:
+        await interaction.response.send_message(
+            "❌ You have no struggle words. Add some first.",
+            ephemeral=True
+        )
+        return
+
+    struggle_id, word, definition = row
+
+    active_challenges[user_id] = (struggle_id, definition)
+
+    await interaction.response.send_message(
+        f"🧠 **Challenge Time!**\n\nWhat is the definition of:\n\n👉 **{word}** ?\n\nType your answer in chat.",
+        ephemeral=False
+    )
+
+
+
+# ------------------------------------------------------------
+# /points — see your points
+# ------------------------------------------------------------
+
+@tree.command(name="points", description="Check your points.")
+async def points_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    pts = get_points(guild_id, user_id)
+    await interaction.response.send_message(
+        f"⭐ You have **{pts}** points.",
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# /shop — list titles
+# ------------------------------------------------------------
+
+@tree.command(name="shop", description="View the title shop.")
+async def shop_cmd(interaction: discord.Interaction):
+    rows = list_titles()
+    if not rows:
+        await interaction.response.send_message(
+            "Shop is empty.",
+            ephemeral=True
+        )
+        return
+
+    msg = "**🏪 TITLE SHOP:**\n\n"
+    for tid, name, color, price in rows:
+        msg += f"• **[{name}]** — `{color}` — **{price} pts** (id: `{tid}`)\n"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+# ------------------------------------------------------------
+# /buy_title — purchase a title by ID
+# ------------------------------------------------------------
+
+@tree.command(name="buy_title", description="Purchase a title by ID.")
+@app_commands.describe(title_id="ID from /shop")
+async def buy_title(interaction: discord.Interaction, title_id: int):
+    guild_id = interaction.guild_id
+    user = interaction.user
+
+    result = purchase_title(guild_id, user.id, title_id)
+
+    if result == "NO_TITLE":
+        await interaction.response.send_message("❌ Invalid title ID.", ephemeral=True)
+        return
+
+    if result == "NO_POINTS":
+        await interaction.response.send_message("❌ You do not have enough points.", ephemeral=True)
+        return
+
+    # Success → apply role
+    c.execute("SELECT name, color FROM titles WHERE id = ?", (title_id,))
+    row = c.fetchone()
+    name, color = row
+
+    try:
+        await apply_title_color(interaction.guild.get_member(user.id), color, name)
     except Exception as e:
-        print("Failed to sync commands:", e)
-    try:
-        if not daily_reminder_task.is_running():
-            daily_reminder_task.start()
-        if not midnight_task.is_running():
-            midnight_task.start()
-    except Exception:
-        pass
-    print("Background tasks started.")
+        await interaction.response.send_message(f"⚠️ Title purchased but color assignment failed.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"🎉 You bought the title **[{name}]**!",
+        ephemeral=False
+    )
+
+
+# ------------------------------------------------------------
+# /done — the main daily check-in
+# ------------------------------------------------------------
+
+@tree.command(name="done", description="Mark today as completed.")
+async def done_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    date_str = today_cst_str()
+    time_str = now_cst().strftime("%I:%M %p")
+
+    success = record_completion(guild.id, user, date_str, time_str)
+
+    if not success:
+        await interaction.response.send_message(
+            "You already marked today as done.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🔥 **{user.display_name}** marked today as DONE!",
+        ephemeral=False
+    )
+
+
+# ------------------------------------------------------------
+# /setchannel — bot reminders channel
+# ------------------------------------------------------------
+
+@tree.command(name="setchannel", description="Set the daily reminder channel.")
+@app_commands.describe(channel="Channel to send reminders to")
+async def setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    upsert_settings(interaction.guild_id, channel_id=channel.id)
+    await interaction.response.send_message(
+        f"📌 Reminder channel set to {channel.mention}.",
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# /setrole — set the role to ping
+# ------------------------------------------------------------
+
+@tree.command(name="setrole", description="Set the role that receives reminders.")
+@app_commands.describe(role="Role to ping")
+async def setrole(interaction: discord.Interaction, role: discord.Role):
+    upsert_settings(interaction.guild_id, ping_role_id=role.id)
+    await interaction.response.send_message(
+        f"🔔 Ping role set to **{role.name}**.",
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# /toggleping — on/off for role pinging
+# ------------------------------------------------------------
+
+@tree.command(name="toggleping", description="Enable/disable role pinging.")
+async def toggleping(interaction: discord.Interaction):
+    s = get_settings(interaction.guild_id)
+    new_val = not s["ping_enabled"]
+    upsert_settings(interaction.guild_id, ping_enabled=new_val)
+
+    await interaction.response.send_message(
+        f"🔄 Ping role is now **{'ENABLED' if new_val else 'DISABLED'}**.",
+        ephemeral=True
+    )
+
+
+# ============================================================
+#             END OF QUADRANT 3 (SLASH COMMANDS)
+# ============================================================
+
+# ---------------------------
+# arabic_bot_full.py - Part 4
+# ---------------------------
+
+# ============================================================
+#                MESSAGE LISTENER FOR CHALLENGES
+# ============================================================
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore bot messages
+    if message.author.bot:
+        return
+
+    user_id = message.author.id
+    guild_id = message.guild.id if message.guild else None
+
+    # Check if user is in an active challenge
+    if user_id in active_challenges:
+        struggle_id, correct_definition = active_challenges[user_id]
+
+        user_answer = message.content.strip()
+
+        # USE THE REAL FUNCTION
+        score = evaluate_answer(user_answer, correct_definition, struggle_id)
+
+        if score >= 0.5:
+            add_points(guild_id, user_id, 5)
+            del active_challenges[user_id]
+
+            await message.channel.send(
+                f"🔥 **Correct!** You earned **5 points!**\n"
+                f"Similarity score: `{score:.2f}`"
+            )
+        else:
+            await message.channel.send(
+                f"❌ Not quite. Try again!\n"
+                f"Similarity score: `{score:.2f}`"
+            )
+
+    await bot.process_commands(message)
+
+
+# ============================================================
+#                 DAILY REMINDER TASK (12 PM)
+# ============================================================
 
 @tasks.loop(seconds=60)
 async def daily_reminder_task():
     now = now_cst()
-    target = now.replace(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, second=0, microsecond=0)
+    target = now.replace(hour=12, minute=0, second=0, microsecond=0)
     if now >= target and now < (target + timedelta(minutes=1)):
         for guild in bot.guilds:
-            if GUILD_ID and guild.id != GUILD_ID:
-                continue
             settings = get_settings(guild.id)
-            channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
-            if not channel:
+
+            if settings["last_reminder_date"] == today_cst_str():
                 continue
-            if settings.get("last_reminder_date") == today_cst_str():
-                continue
-            try:
-                sent = await send_reminder_message(guild, triggered_by="scheduled")
-                if sent:
-                    upsert_settings(guild.id, last_reminder_date=today_cst_str())
-            except Exception:
-                pass
+
+            await send_reminder_message(guild)
+            upsert_settings(guild.id, last_reminder_date=today_cst_str())
+
+
+# ============================================================
+#                  MIDNIGHT SUMMARY TASK (12 AM)
+# ============================================================
 
 @tasks.loop(minutes=5)
 async def midnight_task():
     now = now_cst()
+
+    # Runs one time between 12:00–12:05 AM CST
     if now.hour == 0 and now.minute < 5:
         for guild in bot.guilds:
-            if GUILD_ID and guild.id != GUILD_ID:
-                continue
             await send_summary_embed(guild)
             reset_streaks_for_missed_yesterday(guild)
-        await asyncio.sleep(60)
 
-# =====================================================================
-# MAIN RUN WRAPPER
-# =====================================================================
+        await asyncio.sleep(60)  # prevent double firing
+
+
+# ============================================================
+#                          ON READY
+# ============================================================
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+
+    # Sync commands
+    try:
+        await tree.sync()
+        print("Slash commands synced.")
+    except Exception as e:
+        print("Sync error:", e)
+
+    # Start tasks
+    try:
+        if not daily_reminder_task.is_running():
+            daily_reminder_task.start()
+
+        if not midnight_task.is_running():
+            midnight_task.start()
+    except Exception as e:
+        print("Task start error:", e)
+
+    print("Bot is fully ready.")
+
+
+# ============================================================
+#                        BOOTSTRAP
+# ============================================================
+
 async def main():
     await bot.start(TOKEN)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
+
