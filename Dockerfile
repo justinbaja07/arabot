@@ -1,29 +1,23 @@
-# Use a lightweight Python base image
-FROM python:3.10-slim
+# Use a smaller base image
+FROM python:3.10-slim-bookworm
 
-# Prevent Python from writing .pyc files and buffering output
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies required for Torch + sentence-transformers
+# Install only minimal deps for sentence-transformers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
     git \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create working directory
 WORKDIR /app
 
-# Copy requirements first (better caching)
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install lightweight CPU-only torch
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the bot files
 COPY . .
 
-# Start the bot
 CMD ["python", "arabic_bot_full.py"]
