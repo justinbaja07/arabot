@@ -1,4 +1,3 @@
-# arabic_bot_full.py
 import os
 import sqlite3
 import asyncio
@@ -18,10 +17,6 @@ REMINDER_MINUTE = 0
 GUILD_ID = 1438553047344353293
 # ----------------------------------------
 
-# ⏰ Shutdown Schedule
-SLEEP_START = dtime(0, 30)     # 12:30 AM CST
-SLEEP_END   = dtime(8, 30)     #  8:30 AM CST
-
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -31,7 +26,6 @@ tree = bot.tree
 
 # ---------- Database setup ----------
 DB = "arabic_bot.db"
-# Allow access from async tasks — keep single connection but it's OK for small bots.
 conn = sqlite3.connect(DB, check_same_thread=False)
 c = conn.cursor()
 
@@ -104,7 +98,7 @@ def upsert_settings(guild_id: int, **kwargs):
 def record_completion(guild_id: int, user: discord.Member, date_str: str, time_str: str):
     c.execute("SELECT 1 FROM completions WHERE guild_id = ? AND user_id = ? AND date = ?", (guild_id, user.id, date_str))
     if c.fetchone():
-        return False  # already recorded today
+        return False
 
     c.execute("INSERT INTO completions (guild_id, user_id, username, date, time) VALUES (?, ?, ?, ?, ?)",
               (guild_id, user.id, str(user), date_str, time_str))
@@ -132,7 +126,7 @@ def record_completion(guild_id: int, user: discord.Member, date_str: str, time_s
 
 def get_today_completions(guild_id: int):
     date_str = today_cst_str()
-    c.execute("SELECT username, time FROM completions WHERE guild_id = ? AND date = ? ORDER BY time", (guild_id, date_str))
+    c.execute("SELECT username, time FROM completions WHERE guild_id = ? AND date = ?", (guild_id, date_str))
     return c.fetchall()
 
 def get_user_streak(guild_id: int, user_id: int):
@@ -159,7 +153,7 @@ def reset_streaks_for_missed_yesterday(guild: discord.Guild):
     settings = get_settings(guild.id)
     tracked = []
     if settings.get("ping_role_id"):
-        role = guild.get_role(settings["ping_role_id"])
+        role = guild.get_role(settings.get("ping_role_id"))
         if role:
             tracked = [m for m in role.members if not m.bot]
     else:
@@ -176,34 +170,30 @@ def reset_streaks_for_missed_yesterday(guild: discord.Guild):
     return missed
 
 # =====================================================
-# New: Reminder embed + interactive button (behaves like /done)
+# Reminder UI
 # =====================================================
 from discord import ui
 
-# Global flag to announce wake in on_ready after a sleep cycle
-WAS_ASLEEP = False
+WAS_ASLEEP = False  # (unused now but preserved for minimal-change request)
 
 def build_reminder_embed(guild: discord.Guild, triggered_by: str = "scheduled") -> discord.Embed:
-    """
-    Build a nicer reminder embed: a small table of today's completions and a mini leaderboard.
-    """
     today = today_cst_str()
-    done_rows = get_today_completions(guild.id)  # [(username, time), ...]
+    done_rows = get_today_completions(guild.id)
     lb = get_leaderboard(guild.id, limit=5)
 
     embed = discord.Embed(title="⏰ Arabic Reminder", color=0x2ECC71)
     embed.set_footer(text=f"Trigger: {triggered_by} • {today} CST")
 
-    # Build a small table (monospaced) for today's completions
     if done_rows:
-        # compute width
         name_col = "Name"
         time_col = "Time"
         rows = [(r[0], r[1]) for r in done_rows]
-        # compute widths
         name_w = max(len(name_col), *(len(r[0]) for r in rows))
         time_w = max(len(time_col), *(len(r[1]) for r in rows))
-        lines = [f"{name_col.ljust(name_w)} | {time_col.ljust(time_w)}", f"{'-'*name_w}-+-{'-'*time_w}"]
+        lines = [
+            f"{name_col.ljust(name_w)} | {time_col.ljust(time_w)}",
+            f"{'-'*name_w}-+-{'-'*time_w}"
+        ]
         for name, t in rows:
             lines.append(f"{name.ljust(name_w)} | {t.ljust(time_w)}")
         table = "```\n" + "\n".join(lines) + "\n```"
@@ -211,10 +201,9 @@ def build_reminder_embed(guild: discord.Guild, triggered_by: str = "scheduled") 
     else:
         embed.add_field(name="✅ Today's Completions", value="No completions yet today. Be the first! ✨", inline=False)
 
-    # mini leaderboard
     if lb:
-        lb_lines = []
         medals = ["🥇", "🥈", "🥉"]
+        lb_lines = []
         for i, (username, streak, total) in enumerate(lb):
             medal = medals[i] if i < 3 else f"{i+1}."
             lb_lines.append(f"{medal} {username} — Streak: {streak} | Total: {total}")
@@ -230,11 +219,8 @@ class ReminderView(ui.View):
         super().__init__(timeout=timeout)
         self.guild = guild
 
-    @ui.button(label="Mark Arabic Done (today)", style=discord.ButtonStyle.primary, custom_id=None)
+    @ui.button(label="Mark Arabic Done (today)", style=discord.ButtonStyle.primary)
     async def mark_done(self, interaction: discord.Interaction, button: ui.Button):
-        """
-        This callback acts like the /done command: records completion, updates streaks, and updates the embed in-place.
-        """
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("This button can only be used in a server.", ephemeral=True)
@@ -247,10 +233,8 @@ class ReminderView(ui.View):
             await interaction.response.send_message("You already marked done today.", ephemeral=True)
             return
 
-        # Update the message's embed to reflect the new completion
         try:
             new_embed = build_reminder_embed(guild, triggered_by="interactive")
-            # edit original message (if possible)
             if interaction.message:
                 await interaction.message.edit(embed=new_embed, view=self)
         except Exception:
@@ -258,11 +242,7 @@ class ReminderView(ui.View):
 
         await interaction.response.send_message(f"Marked done at {time_str} CST. Nice!", ephemeral=True)
 
-async def send_reminder_message(guild: discord.Guild, triggered_by: str = "scheduled") -> Optional[discord.Message]:
-    """
-    Send the nicer reminder embed + button to the guild's configured channel (or system channel).
-    Returns the message if sent.
-    """
+async def send_reminder_message(guild: discord.Guild, triggered_by: str = "scheduled"):
     settings = get_settings(guild.id)
     channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
     if not channel:
@@ -270,7 +250,7 @@ async def send_reminder_message(guild: discord.Guild, triggered_by: str = "sched
 
     msg_text = None
     if settings.get("ping_enabled") and settings.get("ping_role_id"):
-        role = guild.get_role(settings["ping_role_id"])
+        role = guild.get_role(settings.get("ping_role_id"))
         if role:
             msg_text = f"{role.mention} Have you done Arabic yet?"
 
@@ -281,8 +261,7 @@ async def send_reminder_message(guild: discord.Guild, triggered_by: str = "sched
             return await channel.send(content=msg_text, embed=embed, view=view)
         else:
             return await channel.send(embed=embed, view=view)
-    except Exception as e:
-        print("Failed sending reminder message to guild", guild.id, e)
+    except Exception:
         return None
 
 # ========== Slash Commands ==========
@@ -352,7 +331,6 @@ async def slash_reminder(interaction: discord.Interaction):
 
     sent = await send_reminder_message(guild, triggered_by="manual")
     if sent:
-        # mark last_reminder_date so scheduled won't also send immediately
         upsert_settings(guild.id, last_reminder_date=today_cst_str())
         await interaction.response.send_message(f"Reminder sent to {channel.mention}", ephemeral=True)
     else:
@@ -390,7 +368,7 @@ async def slash_leaderboard(interaction: discord.Interaction):
     embed.description = leaderboard_text
     await interaction.response.send_message(embed=embed)
 
-# ---------- Gamified summary embed ----------
+# ---------- Summary embed ----------
 async def send_summary_embed(guild: discord.Guild):
     settings = get_settings(guild.id)
     channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
@@ -404,7 +382,7 @@ async def send_summary_embed(guild: discord.Guild):
 
     tracked = []
     if settings.get("ping_role_id"):
-        role = guild.get_role(settings["ping_role_id"])
+        role = guild.get_role(settings.get("ping_role_id"))
         if role:
             tracked = [m for m in role.members if not m.bot]
     else:
@@ -437,7 +415,6 @@ async def send_summary_embed(guild: discord.Guild):
 # ---------- Background tasks ----------
 @bot.event
 async def on_ready():
-    global WAS_ASLEEP
     print(f"Logged in as {bot.user} (id {bot.user.id})")
     try:
         if GUILD_ID:
@@ -457,22 +434,6 @@ async def on_ready():
         pass
     print("Background tasks started.")
 
-    # If we were asleep previously, announce wake to channels
-    if WAS_ASLEEP:
-        print("Announcing wake to guild channels...")
-        for guild in bot.guilds:
-            if GUILD_ID and guild.id != GUILD_ID:
-                continue
-            settings = get_settings(guild.id)
-            channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
-            if not channel:
-                continue
-            try:
-                await channel.send("🌅 I'm back! The bot has resumed its normal schedule. Good morning! (8:30 AM CST)")
-            except Exception as e:
-                print("Failed to send wake message to guild", guild.id, e)
-        WAS_ASLEEP = False
-
 @tasks.loop(seconds=60)
 async def daily_reminder_task():
     now = now_cst()
@@ -491,8 +452,8 @@ async def daily_reminder_task():
                 sent = await send_reminder_message(guild, triggered_by="scheduled")
                 if sent:
                     upsert_settings(guild.id, last_reminder_date=today_cst_str())
-            except Exception as e:
-                print("Failed to send reminder to guild", guild.id, e)
+            except Exception:
+                pass
 
 @tasks.loop(minutes=5)
 async def midnight_task():
@@ -506,73 +467,9 @@ async def midnight_task():
         await asyncio.sleep(60)
 
 # =====================================================================
-# 🛏️ NIGHTLY SHUTDOWN + MORNING RESTART — RAILWAY SAFE
-# =====================================================================
-async def sleep_wake_loop():
-    """
-    This task runs 24/7 and performs:
-    - Graceful shutdown at 12:30 AM CST
-    - Sleep until 8:30 AM CST
-    - Auto restart bot
-    """
-    global WAS_ASLEEP
-    while True:
-        now = now_cst()
-        current = now.time()
-
-        # If inside sleep window → shutdown
-        if SLEEP_START <= current < SLEEP_END:
-            print("⛔ Bot entering nightly sleep mode.")
-
-            # Announce to guild channels that we're going to sleep (so users see a message at 12:30am)
-            for guild in bot.guilds:
-                if GUILD_ID and guild.id != GUILD_ID:
-                    continue
-                settings = get_settings(guild.id)
-                channel = guild.get_channel(settings.get("channel_id")) or guild.system_channel
-                if not channel:
-                    continue
-                try:
-                    await channel.send("⛔ The bot is going to sleep for the night now (12:30 AM CST). It will return at 8:30 AM CST.")
-                except Exception as e:
-                    print("Failed to send sleep message to guild", guild.id, e)
-
-            WAS_ASLEEP = True
-            try:
-                # Close the bot connection gracefully. The process remains alive because this loop continues.
-                await bot.close()
-            except Exception:
-                pass
-
-            # Calculate wake time
-            today = now.date()
-            wake_dt = datetime.combine(today, SLEEP_END).replace(tzinfo=TIMEZONE)
-            if wake_dt <= now:
-                wake_dt += timedelta(days=1)
-
-            sleep_seconds = (wake_dt - now).total_seconds()
-            print(f"💤 Sleeping for {sleep_seconds/3600:.2f} hours...")
-            await asyncio.sleep(sleep_seconds)
-
-            print("🌅 Restarting bot for the day...")
-            # start the bot anew (this will re-enter on_ready where tasks are started and wake message announced)
-            try:
-                await bot.start(TOKEN)
-            except Exception as e:
-                print("Error restarting bot:", e)
-                # backoff a bit and try again
-                await asyncio.sleep(10)
-
-        # Not in sleep window: wait and check again
-        await asyncio.sleep(60)
-
-# =====================================================================
 # MAIN RUN WRAPPER
 # =====================================================================
 async def main():
-    # Start the sleep/wake loop as a background task
-    asyncio.create_task(sleep_wake_loop())
-    # Start the bot normally
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
