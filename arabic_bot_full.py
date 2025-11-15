@@ -337,6 +337,57 @@ def evaluate_answer(user_answer: str, correct_definition: str, struggle_id: int)
 
     return sim
 
+async def send_reminder_message(guild: discord.Guild):
+    settings = get_settings(guild.id)
+    channel_id = settings.get("channel_id")
+    ping_role_id = settings.get("ping_role_id")
+    ping_enabled = settings.get("ping_enabled")
+
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+
+    role_txt = f"<@&{ping_role_id}>" if (ping_enabled and ping_role_id) else ""
+
+    embed = discord.Embed(
+        title="📘 Daily Arabic Reminder",
+        description="Don't forget to do your Arabic today!",
+        color=0x00B2FF
+    )
+
+    await channel.send(content=role_txt, embed=embed)
+
+
+async def send_summary_embed(guild: discord.Guild):
+    rows = get_today_completions(guild.id)
+
+    embed = discord.Embed(
+        title="🌙 Daily Summary",
+        description="Here’s who completed their Arabic today.",
+        color=0xFFD700
+    )
+
+    if rows:
+        for username, t in rows:
+            embed.add_field(name=username, value=f"Completed at {t}", inline=False)
+    else:
+        embed.add_field(name="Nobody completed today 😭", value="Try again tomorrow!", inline=False)
+
+    settings = get_settings(guild.id)
+    channel_id = settings.get("channel_id")
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if not channel:
+        return
+
+    await channel.send(embed=embed)
+
+
 
 # ----------------------------------------
 # POINTS SYSTEM
@@ -719,12 +770,12 @@ async def on_message(message: discord.Message):
     if user_id in active_challenges:
         struggle_id, correct_definition = active_challenges[user_id]
 
-        # Compare LLM-evaluated correctness
         user_answer = message.content.strip()
-        score = ai_similarity(user_answer, correct_definition)
+
+        # USE THE REAL FUNCTION
+        score = evaluate_answer(user_answer, correct_definition, struggle_id)
 
         if score >= 0.5:
-            # Award points
             add_points(guild_id, user_id, 5)
             del active_challenges[user_id]
 
@@ -739,6 +790,7 @@ async def on_message(message: discord.Message):
             )
 
     await bot.process_commands(message)
+
 
 
 # ============================================================
@@ -815,5 +867,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
