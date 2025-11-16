@@ -907,7 +907,15 @@ async def summary_cmd(interaction: discord.Interaction):
 
     if rows:
         for username, t in rows:
-            embed.add_field(name=username, value=f"Completed at {t}", inline=False)
+            # Try to get member object to pull title
+            member = guild.get_member_named(username)
+            if member:
+                display = get_display_name_with_title(guild.id, member)
+            else:
+                display = username
+
+            embed.add_field(name=display, value=f"Completed at {t}", inline=False)
+
     else:
         embed.add_field(
             name="Nobody completed today 😭",
@@ -918,15 +926,14 @@ async def summary_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
-
 # ------------------------------------------------------------
 # /leaderboard — Streak ranking (Top 10)
 # ------------------------------------------------------------
 @tree.command(name="leaderboard", description="View the top streaks.")
 async def leaderboard_cmd(interaction: discord.Interaction):
 
-    guild_id = interaction.guild_id
-    rows = get_leaderboard_streaks(guild_id, limit=10)
+    guild = interaction.guild
+    rows = get_leaderboard_streaks(interaction.guild_id, limit=10)
 
     embed = discord.Embed(
         title="🏆 Streak Leaderboard",
@@ -938,17 +945,23 @@ async def leaderboard_cmd(interaction: discord.Interaction):
     else:
         rank = 1
         for username, streak, total in rows:
-            embed.add_field(
-                member = interaction.guild.get_member_named(username)
-display = f"[{get_user_title(interaction.guild_id, member.id)[0]}] {username}" if member and get_user_title(interaction.guild_id, member.id) else username
-name=f"#{rank} — {display}",
 
+            member = guild.get_member_named(username)
+
+            if member:
+                display = get_display_name_with_title(interaction.guild_id, member)
+            else:
+                display = username
+
+            embed.add_field(
+                name=f"#{rank} — {display}",
                 value=f"🔥 **{streak}** day streak\n📘 {total} total completions",
                 inline=False
             )
             rank += 1
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
+
 
 
 # ------------------------------------------------------------
@@ -965,17 +978,18 @@ async def done_cmd(interaction: discord.Interaction):
 
     success = record_completion(guild.id, user, date_str, time_str)
 
+    # Get title name for display
+    name = get_display_name_with_title(interaction.guild_id, user)
+
     if not success:
         await interaction.response.send_message(
-            "You already marked today as done.",
+            f"❌ **{name}**, you already marked today as done.",
             ephemeral=True
         )
         return
 
     await interaction.response.send_message(
-       name = get_display_name_with_title(interaction.guild_id, user)
-f"🔥 **{name}** marked today as DONE!"
-
+        f"🔥 **{name}** marked today as DONE!",
         ephemeral=False
     )
 
@@ -1041,52 +1055,69 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    user_id = message.author.id
-    guild_id = message.guild.id if message.guild else None
+    if not message.guild:
+        return
 
-    # Only proceed if this user currently has a challenge
+    user_id = message.author.id
+    guild_id = message.guild.id
+
     chal = active_challenges.get(user_id)
+
+    # Only respond if user has an active challenge
     if chal:
         # Check expiry
         if now_cst() > chal["expires_at"]:
-            # expired: remove and inform
             async with _active_challenge_lock:
                 if user_id in active_challenges:
                     del active_challenges[user_id]
-            try:
-                await message.channel.send(f"⌛ Challenge expired. Run `/challenge` to get a new one.")
-            except:
-                pass
+
+            await message.channel.send(
+                "⌛ Your challenge expired. Run `/challenge` to get a new one."
+            )
+
         else:
+            # User answer
             user_answer = message.content.strip()
             struggle_id = int(chal["struggle_id"])
             correct_definition = chal["definition"]
-            # Evaluate in a thread so the event loop isn't blocked
+
+            # Evaluate similarity OFF the main thread
             try:
-                score = await asyncio.to_thread(evaluate_answer, user_answer, correct_definition, struggle_id)
-            except Exception as e:
-                # On error, remove challenge and notify
+                score = await asyncio.to_thread(
+                    evaluate_answer,
+                    user_answer,
+                    correct_definition,
+                    struggle_id
+                )
+            except:
                 async with _active_challenge_lock:
                     if user_id in active_challenges:
                         del active_challenges[user_id]
-                await message.channel.send("⚠️ Error evaluating your answer. Try `/challenge` again.")
+
+                await message.channel.send(
+                    "⚠️ Error evaluating your answer. Try `/challenge` again."
+                )
                 await bot.process_commands(message)
                 return
 
-            # Single attempt policy: correct -> award & close; wrong -> reveal & close
+            # Display name with title
+            name = get_display_name_with_title(message.guild.id, message.author)
+
+            # Correct answer
             if score >= CHALLENGE_SIM_THRESHOLD:
                 add_points(guild_id, user_id, POINTS_PER_CORRECT)
+
                 async with _active_challenge_lock:
                     if user_id in active_challenges:
                         del active_challenges[user_id]
-                name = get_display_name_with_title(message.guild.id, message.author)
-await message.channel.send(
-    f"🔥 **{name} — Correct!** You earned **5 points!**\n"
 
+                await message.channel.send(
+                    f"🔥 **{name} — Correct!** You earned **5 points!**\n"
                     f"Similarity score: `{score:.2f}`"
                 )
+
+            # Incorrect answer
             else:
-                # reveal the expected answer and close challenge
                 async with _active_challenge_lock:
                     if user_id in active_challenges:
                         expected = active_challenges[user_id]["definition"]
@@ -1095,15 +1126,16 @@ await message.channel.send(
                     else:
                         expected = correct_definition
                         word_txt = chal.get("word", "")
-                name = get_display_name_with_title(message.guild.id, message.author)
-await message.channel.send(
-    f"❌ **{name}**, not quite. Try again!\n"
 
-                    f"Similarity score: `{score:.2f}`\nRun `/challenge` to try another."
+                await message.channel.send(
+                    f"❌ **{name}**, not quite!\n"
+                    f"Similarity score: `{score:.2f}`\n"
+                    f"Run `/challenge` to try another."
                 )
 
-    # allow other commands to be processed
+    # Continue processing slash commands
     await bot.process_commands(message)
+
 
 
 
@@ -1219,6 +1251,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
