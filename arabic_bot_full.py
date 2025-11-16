@@ -458,7 +458,13 @@ async def send_summary_embed(guild: discord.Guild):
 
     if rows:
         for username, t in rows:
-            embed.add_field(name=username, value=f"Completed at {t}", inline=False)
+            name = username
+member = interaction.guild.get_member_named(username)
+if member:
+    name = get_display_name_with_title(interaction.guild_id, member)
+
+embed.add_field(name=name, value=f"Completed at {t}", inline=False)
+
     else:
         embed.add_field(name="Nobody completed today 😭", value="Try again tomorrow!", inline=False)
 
@@ -552,32 +558,6 @@ def purchase_title(guild_id: int, user_id: int, title_id: int):
 # AUTO COLOR ROLE SYSTEM
 # ----------------------------------------
 
-async def apply_title_color(member: discord.Member, color_hex: str, title_name: str):
-    """
-    Creates/gets a role with the correct title & color and applies it to the user.
-    """
-    guild = member.guild
-    color_int = int(color_hex.lstrip("#"), 16)
-
-    # Check if role exists
-    role = discord.utils.get(guild.roles, name=f"[{title_name}]")
-    if role is None:
-        role = await guild.create_role(
-            name=f"[{title_name}]",
-            colour=discord.Colour(color_int),
-            reason="Title purchase"
-        )
-
-    # Remove old title roles
-    for r in member.roles:
-        if r.name.startswith("[") and r.name.endswith("]"):
-            try:
-                await member.remove_roles(r)
-            except:
-                pass
-
-    # Give new one
-    await member.add_roles(role)
 
 
 # --------------------
@@ -864,22 +844,17 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
     row = c.fetchone()
     name, color = row
 
-    try:
-        member = interaction.guild.get_member(user.id)
-        if member is None:
-            member = await interaction.guild.fetch_member(user.id)
-        await apply_title_color(member, color, name)
-    except Exception:
-        await interaction.response.send_message(
-            "⚠️ Title purchased but color assignment failed (role creation/assignment).",
-            ephemeral=True
-        )
-        return
-
+    
     await interaction.response.send_message(
         f"🎉 You bought the title **[{name}]**!",
         ephemeral=False
     )
+
+def get_display_name_with_title(guild_id: int, user: discord.Member):
+    title = get_user_title(guild_id, user.id)
+    if title:
+        return f"[{title[0]}] {user.display_name}"
+    return user.display_name
 
 
 # ------------------------------------------------------------
@@ -964,7 +939,10 @@ async def leaderboard_cmd(interaction: discord.Interaction):
         rank = 1
         for username, streak, total in rows:
             embed.add_field(
-                name=f"#{rank} — {username}",
+                member = interaction.guild.get_member_named(username)
+display = f"[{get_user_title(interaction.guild_id, member.id)[0]}] {username}" if member and get_user_title(interaction.guild_id, member.id) else username
+name=f"#{rank} — {display}",
+
                 value=f"🔥 **{streak}** day streak\n📘 {total} total completions",
                 inline=False
             )
@@ -995,7 +973,9 @@ async def done_cmd(interaction: discord.Interaction):
         return
 
     await interaction.response.send_message(
-        f"🔥 **{user.display_name}** marked today as DONE!",
+       name = get_display_name_with_title(interaction.guild_id, user)
+f"🔥 **{name}** marked today as DONE!"
+
         ephemeral=False
     )
 
@@ -1099,8 +1079,10 @@ async def on_message(message: discord.Message):
                 async with _active_challenge_lock:
                     if user_id in active_challenges:
                         del active_challenges[user_id]
-                await message.channel.send(
-                    f"🔥 **Correct!** You earned **{POINTS_PER_CORRECT} points!**\n"
+                name = get_display_name_with_title(message.guild.id, message.author)
+await message.channel.send(
+    f"🔥 **{name} — Correct!** You earned **5 points!**\n"
+
                     f"Similarity score: `{score:.2f}`"
                 )
             else:
@@ -1113,8 +1095,10 @@ async def on_message(message: discord.Message):
                     else:
                         expected = correct_definition
                         word_txt = chal.get("word", "")
-                await message.channel.send(
-                    f"❌ Not quite. The correct answer for **{word_txt}** was:\n`{expected}`\n"
+                name = get_display_name_with_title(message.guild.id, message.author)
+await message.channel.send(
+    f"❌ **{name}**, not quite. Try again!\n"
+
                     f"Similarity score: `{score:.2f}`\nRun `/challenge` to try another."
                 )
 
