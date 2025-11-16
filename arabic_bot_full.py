@@ -1002,6 +1002,7 @@ async def leaderboard_cmd(interaction: discord.Interaction):
 # ------------------------------------------------------------
 # /done — the main daily check-in
 # ------------------------------------------------------------
+
 @tree.command(name="done", description="Mark today as completed.")
 async def done_cmd(interaction: discord.Interaction):
     guild = interaction.guild
@@ -1010,10 +1011,9 @@ async def done_cmd(interaction: discord.Interaction):
     date_str = today_cst_str()
     time_str = now_cst().strftime("%I:%M %p")
 
-    # Try to record completion
+    # record_completion returns False if already done today
     success = record_completion(guild.id, user, date_str, time_str)
 
-    # Display name w/ title
     name = get_display_name_with_title(interaction.guild_id, user)
 
     if not success:
@@ -1023,11 +1023,13 @@ async def done_cmd(interaction: discord.Interaction):
         )
         return
 
+    # Award daily points (ONLY on first completion of the day)
+    add_points(guild.id, user.id, 10)
+
     await interaction.response.send_message(
-        f"🔥 **{name}** marked today as DONE!",
+        f"🔥 **{name}** marked today as DONE and earned **10 points!**",
         ephemeral=False
     )
-
 
 
 # ------------------------------------------------------------
@@ -1297,6 +1299,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
