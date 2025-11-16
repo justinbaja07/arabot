@@ -756,8 +756,92 @@ async def shop_cmd(interaction: discord.Interaction):
 
 
 # ------------------------------------------------------------
+# ADMIN COMMAND — Add a title to the shop
+# ------------------------------------------------------------
+@tree.command(name="add_title", description="Admin: create a new title for the shop.")
+@app_commands.describe(name="Title name", color="Hex color (#RRGGBB)", price="Point cost")
+async def add_title_cmd(interaction: discord.Interaction, name: str, color: str, price: int):
+
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    ok = create_title(name, color, price)
+
+    if not ok:
+        await interaction.response.send_message("❌ Title already exists.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"🏷️ **Title created!**\nName: **{name}**\nColor: `{color}`\nPrice: **{price} pts**",
+        ephemeral=False
+    )
+
+
+
+# ------------------------------------------------------------
+# ADMIN COMMAND — Set someone’s points
+# ------------------------------------------------------------
+@tree.command(name="set_points", description="Admin: set a user's points.")
+@app_commands.describe(user="User to modify", amount="Point amount to set")
+async def set_points_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    c.execute("""
+        INSERT INTO points (guild_id, user_id, points)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET points = excluded.points
+    """, (interaction.guild_id, user.id, amount))
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"✨ Set **{user.display_name}**'s points to **{amount}**.",
+        ephemeral=False
+    )
+
+
+
+# ------------------------------------------------------------
+# ADMIN COMMAND — Set someone’s streak
+# ------------------------------------------------------------
+@tree.command(name="set_streak", description="Admin: set a user's streak.")
+@app_commands.describe(user="User to modify", amount="New streak number")
+async def set_streak_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    c.execute("""
+        INSERT INTO streaks (guild_id, user_id, username, streak, last_done_date, total_completions)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET streak = excluded.streak
+    """, (
+        interaction.guild_id,
+        user.id,
+        str(user),
+        amount,
+        None,
+        0
+    ))
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"🔥 Set **{user.display_name}**'s streak to **{amount}**.",
+        ephemeral=False
+    )
+
+
+
+# ------------------------------------------------------------
 # /buy_title — purchase a title by ID
 # ------------------------------------------------------------
+
 
 @tree.command(name="buy_title", description="Purchase a title by ID.")
 @app_commands.describe(title_id="ID from /shop")
@@ -1062,6 +1146,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
