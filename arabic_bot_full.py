@@ -1461,18 +1461,18 @@ async def on_message(message: discord.Message):
 
 @tasks.loop(seconds=30)
 async def daily_reminder_task():
-    now = now_cst()
-    
-    if now.hour == 12 and now.minute == 0:  # exact 12:00
+    now = datetime.now(cst)
+    today = now.strftime("%Y-%m-%d")
+
+    if now.hour == 12 and now.minute == 0:
         for guild in bot.guilds:
             settings = get_settings(guild.id)
 
-            # Prevent duplicate reminders
-            if settings.get("last_reminder_date") == today_cst_str():
+            if settings.get("last_reminder_date") == today:
                 continue
 
             await send_reminder_message(guild)
-            upsert_settings(guild.id, last_reminder_date=today_cst_str())
+            upsert_settings(guild.id, last_reminder_date=today)
 
 
 # ============================================================
@@ -1481,27 +1481,20 @@ async def daily_reminder_task():
 
 @tasks.loop(seconds=30)
 async def midnight_task():
-    now = now_cst()
+    now = datetime.now(cst)
+    today = now.strftime("%Y-%m-%d")
 
-    if now.hour == 0 and now.minute == 0:  # exact midnight
-        today = today_cst_str()
-
+    if now.hour == 0 and now.minute == 0:
         for guild in bot.guilds:
             settings = get_settings(guild.id)
 
             if settings.get("last_summary_date") == today:
                 continue
 
-            # send summary
             await send_summary_embed(guild)
-
-            # reset streaks
             reset_streaks_for_missed_yesterday(guild)
 
-            # mark as done
             upsert_settings(guild.id, last_summary_date=today)
-
-
 
 # ============================================================
 #                CHALLENGE SWEEPER (unchanged)
@@ -1575,6 +1568,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
