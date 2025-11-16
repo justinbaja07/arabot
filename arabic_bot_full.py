@@ -546,7 +546,8 @@ def get_user_title(guild_id: int, user_id: int):
         WHERE guild_id = ? AND user_id = ?
     """, (guild_id, user_id))
     row = c.fetchone()
-    return row  # row = (title_name,) or None
+    return row  # (name,) or None
+
 
 
 def purchase_title(guild_id: int, user_id: int, title_id: int):
@@ -794,8 +795,6 @@ async def add_title_cmd(interaction: discord.Interaction, name: str, price: int)
     )
 
 
-
-
 # ------------------------------------------------------------
 # ADMIN COMMAND — Set someone’s points
 # ------------------------------------------------------------
@@ -913,15 +912,35 @@ async def stats_cmd(interaction: discord.Interaction):
         color=0x00B2FF
     )
 
-    embed.add_field(name="🔥 Streak", value=f"{streak_info['streak']} days", inline=True)
-    embed.add_field(name="⭐ Points", value=f"{points}", inline=True)
-    embed.add_field(name="📘 Total Completions", value=f"{streak_info['total']}", inline=True)
+    embed.add_field(
+        name="🔥 Streak",
+        value=f"{streak_info['streak']} days",
+        inline=True
+    )
+    embed.add_field(
+        name="⭐ Points",
+        value=f"{points}",
+        inline=True
+    )
+    embed.add_field(
+        name="📘 Total Completions",
+        value=f"{streak_info['total']}",
+        inline=True
+    )
 
-        if title:
-        embed.add_field(name="🏅 Title", value=f"[{title[0]}]", inline=False)
+    # TITLE FIELD (no color version)
+    if title:
+        embed.add_field(
+            name="🏅 Title",
+            value=f"[{title[0]}]",
+            inline=False
+        )
     else:
-        embed.add_field(name="🏅 Title", value="None", inline=False)
-
+        embed.add_field(
+            name="🏅 Title",
+            value="None",
+            inline=False
+        )
 
     embed.set_footer(text="Keep studying! You got this 💪")
 
@@ -1319,6 +1338,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
