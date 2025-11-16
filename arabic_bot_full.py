@@ -907,14 +907,18 @@ async def summary_cmd(interaction: discord.Interaction):
 
     if rows:
         for username, t in rows:
-            # Try to get member object to pull title
+            # Try to get live member to include title
             member = guild.get_member_named(username)
             if member:
                 display = get_display_name_with_title(guild.id, member)
             else:
-                display = username
+                display = username  # fallback: user left guild
 
-            embed.add_field(name=display, value=f"Completed at {t}", inline=False)
+            embed.add_field(
+                name=display,
+                value=f"Completed at {t}",
+                inline=False
+            )
 
     else:
         embed.add_field(
@@ -923,7 +927,11 @@ async def summary_cmd(interaction: discord.Interaction):
             inline=False
         )
 
-    await interaction.response.send_message(embed=embed, ephemeral=False)
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=False
+    )
+
 
 
 # ------------------------------------------------------------
@@ -941,16 +949,23 @@ async def leaderboard_cmd(interaction: discord.Interaction):
     )
 
     if not rows:
-        embed.add_field(name="Empty", value="Nobody has streaks yet.", inline=False)
+        embed.add_field(
+            name="Empty",
+            value="Nobody has streaks yet.",
+            inline=False
+        )
     else:
         rank = 1
         for username, streak, total in rows:
 
+            # Try to resolve member by name
             member = guild.get_member_named(username)
 
+            # If the user still exists in the guild → show their title
             if member:
                 display = get_display_name_with_title(interaction.guild_id, member)
             else:
+                # Fallback: username only (user left server)
                 display = username
 
             embed.add_field(
@@ -958,6 +973,7 @@ async def leaderboard_cmd(interaction: discord.Interaction):
                 value=f"🔥 **{streak}** day streak\n📘 {total} total completions",
                 inline=False
             )
+
             rank += 1
 
     await interaction.response.send_message(embed=embed, ephemeral=False)
@@ -967,7 +983,6 @@ async def leaderboard_cmd(interaction: discord.Interaction):
 # ------------------------------------------------------------
 # /done — the main daily check-in
 # ------------------------------------------------------------
-
 @tree.command(name="done", description="Mark today as completed.")
 async def done_cmd(interaction: discord.Interaction):
     guild = interaction.guild
@@ -976,9 +991,10 @@ async def done_cmd(interaction: discord.Interaction):
     date_str = today_cst_str()
     time_str = now_cst().strftime("%I:%M %p")
 
+    # Try to record completion
     success = record_completion(guild.id, user, date_str, time_str)
 
-    # Get title name for display
+    # Display name w/ title
     name = get_display_name_with_title(interaction.guild_id, user)
 
     if not success:
@@ -992,6 +1008,7 @@ async def done_cmd(interaction: discord.Interaction):
         f"🔥 **{name}** marked today as DONE!",
         ephemeral=False
     )
+
 
 
 # ------------------------------------------------------------
@@ -1065,23 +1082,26 @@ async def on_message(message: discord.Message):
 
     # Only respond if user has an active challenge
     if chal:
-        # Check expiry
+
+        # ------------------------------
+        # Expired challenge
+        # ------------------------------
         if now_cst() > chal["expires_at"]:
             async with _active_challenge_lock:
-                if user_id in active_challenges:
-                    del active_challenges[user_id]
+                active_challenges.pop(user_id, None)
 
             await message.channel.send(
                 "⌛ Your challenge expired. Run `/challenge` to get a new one."
             )
 
         else:
-            # User answer
+            # ------------------------------
+            # Evaluate user's answer
+            # ------------------------------
             user_answer = message.content.strip()
             struggle_id = int(chal["struggle_id"])
             correct_definition = chal["definition"]
 
-            # Evaluate similarity OFF the main thread
             try:
                 score = await asyncio.to_thread(
                     evaluate_answer,
@@ -1089,10 +1109,9 @@ async def on_message(message: discord.Message):
                     correct_definition,
                     struggle_id
                 )
-            except:
+            except Exception:
                 async with _active_challenge_lock:
-                    if user_id in active_challenges:
-                        del active_challenges[user_id]
+                    active_challenges.pop(user_id, None)
 
                 await message.channel.send(
                     "⚠️ Error evaluating your answer. Try `/challenge` again."
@@ -1100,32 +1119,38 @@ async def on_message(message: discord.Message):
                 await bot.process_commands(message)
                 return
 
-            # Display name with title
-            name = get_display_name_with_title(message.guild.id, message.author)
+            # Title display
+            name = get_display_name_with_title(guild_id, message.author)
 
+            # ------------------------------
             # Correct answer
+            # ------------------------------
             if score >= CHALLENGE_SIM_THRESHOLD:
+
                 add_points(guild_id, user_id, POINTS_PER_CORRECT)
 
                 async with _active_challenge_lock:
-                    if user_id in active_challenges:
-                        del active_challenges[user_id]
+                    active_challenges.pop(user_id, None)
 
                 await message.channel.send(
                     f"🔥 **{name} — Correct!** You earned **5 points!**\n"
                     f"Similarity score: `{score:.2f}`"
                 )
 
+            # ------------------------------
             # Incorrect answer
+            # ------------------------------
             else:
+                # Safely pull expected definition
                 async with _active_challenge_lock:
-                    if user_id in active_challenges:
-                        expected = active_challenges[user_id]["definition"]
-                        word_txt = active_challenges[user_id].get("word", "")
-                        del active_challenges[user_id]
-                    else:
-                        expected = correct_definition
-                        word_txt = chal.get("word", "")
+                    data = active_challenges.pop(user_id, None)
+
+                if data:
+                    expected = data["definition"]
+                    word_txt = data.get("word", "")
+                else:
+                    expected = correct_definition
+                    word_txt = chal.get("word", "")
 
                 await message.channel.send(
                     f"❌ **{name}**, not quite!\n"
@@ -1133,12 +1158,8 @@ async def on_message(message: discord.Message):
                     f"Run `/challenge` to try another."
                 )
 
-    # Continue processing slash commands
+    # Continue processing other commands
     await bot.process_commands(message)
-
-
-
-
 
 # ============================================================
 #                 DAILY REMINDER TASK (12 PM)
@@ -1168,35 +1189,41 @@ async def midnight_task():
     now = now_cst()
     today = today_cst_str()
 
-    for guild in bot.guilds:
-        settings = get_settings(guild.id)
+    # Midnight window: 00:00–00:04
+    if now.hour == 0 and now.minute < 5:
+        for guild in bot.guilds:
+            settings = get_settings(guild.id)
 
-        # Prevent double summary
-        if settings.get("last_summary_date") == today:
-            continue
+            # Avoid repeating summary each night
+            if settings.get("last_summary_date") == today:
+                continue
 
-        if now.hour == 0 and now.minute < 5:
+            # Send summary + reset streaks
             await send_summary_embed(guild)
             reset_streaks_for_missed_yesterday(guild)
+
+            # Save last summary day
             upsert_settings(guild.id, last_summary_date=today)
 
 
+# ============================================================
+#                CHALLENGE SWEEPER (unchanged)
+# ============================================================
 
 @tasks.loop(seconds=10)
 async def _challenge_sweeper():
-    """Remove expired challenges to keep memory clean and notify channels if needed."""
+    """Remove expired challenges from memory."""
     now = now_cst()
     to_remove = []
+
     async with _active_challenge_lock:
         for uid, chal in list(active_challenges.items()):
             if now > chal["expires_at"]:
                 to_remove.append(uid)
+
         for uid in to_remove:
-            try:
-                del active_challenges[uid]
-            except KeyError:
-                pass
-    # No channel notification here; on_message notifies the user when they next message.
+            active_challenges.pop(uid, None)
+
 
 
 # ============================================================
@@ -1251,6 +1278,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
