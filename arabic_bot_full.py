@@ -168,6 +168,18 @@ CREATE TABLE IF NOT EXISTS user_titles (
 )
 """)
 
+# Items sold in the shop (consumables, boosts, etc.)
+c.execute("""
+CREATE TABLE IF NOT EXISTS shop_items (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    type TEXT,          -- freeze, consumable, cosmetic
+    price INTEGER,
+    description TEXT
+)
+""")
+
+
 # --------------------
 # INVENTORY & FREEZE TABLES (NEW)
 # --------------------
@@ -212,6 +224,16 @@ try:
 except Exception:
     # migration best-effort; ignore if structure differs
     pass
+
+# Ensure streak freeze exists in shop
+c.execute("SELECT 1 FROM shop_items WHERE id = 'freeze'")
+if not c.fetchone():
+    c.execute("""
+        INSERT INTO shop_items (id, name, type, price, description)
+        VALUES ('freeze', 'Streak Freeze', 'freeze', 100, 'Protects your streak once')
+    """)
+    conn.commit()
+
 
 # --------------------
 # EMBEDDING MODEL LOAD
@@ -691,6 +713,47 @@ def purchase_title(guild_id: int, user_id: int, title_id: int):
     conn.commit()
     return "OK"
 
+# ----------------------------------------
+# STREAK FREEZE SYSTEM
+# ----------------------------------------
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS streak_freeze (
+    guild_id INTEGER,
+    user_id INTEGER,
+    freezes INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+conn.commit()
+
+
+def get_freezes(guild_id: int, user_id: int):
+    c.execute("SELECT freezes FROM streak_freeze WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+
+def add_freeze(guild_id: int, user_id: int, amount: int):
+    c.execute("""
+        INSERT INTO streak_freeze (guild_id, user_id, freezes)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET freezes = freezes + EXCLUDED.freezes
+    """, (guild_id, user_id, amount))
+    conn.commit()
+
+
+def set_freeze(guild_id: int, user_id: int, amount: int):
+    c.execute("""
+        INSERT INTO streak_freeze (guild_id, user_id, freezes)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET freezes = EXCLUDED.freezes
+    """, (guild_id, user_id, amount))
+    conn.commit()
+
+
 
 # ----------------------------------------
 # AUTO COLOR ROLE SYSTEM
@@ -853,39 +916,49 @@ async def points_cmd(interaction: discord.Interaction):
 
 
 # ------------------------------------------------------------
-# /shop — list titles
+# /shop — unified shop (titles + consumables)
 # ------------------------------------------------------------
-
-@tree.command(name="shop", description="View the title shop.")
+@tree.command(name="shop", description="View the title shop and consumables.")
 async def shop_cmd(interaction: discord.Interaction):
-    rows = list_titles()
-    if not rows:
-        await interaction.response.send_message(
-            "Shop is empty. Admins can add titles with `/add_title`.",
-            ephemeral=True
-        )
-        return
+
+    # Load titles
+    titles = list_titles()
+
+    # Load consumables from shop_items
+    c.execute("SELECT id, name, price, description FROM shop_items ORDER BY price ASC")
+    items = c.fetchall()
 
     embed = discord.Embed(
-        title="🏪 Title Shop",
-        description="Available titles",
+        title="🏪 Shop",
+        description="Available items you can buy",
         color=0x00B2FF
     )
 
-    for tid, name, price in rows:
-        embed.add_field(
-            name=f"[{name}] — {price} pts",
-            value=f"id: `{tid}`",
-            inline=False
-        )
+    # ---- Titles Section ----
+    if titles:
+        embed.add_field(name="🏅 Titles", value="\u200b", inline=False)
+        for tid, name, color, price in titles:
+            embed.add_field(
+                name=f"[{name}] — {price} pts",
+                value=f"ID: `{tid}`\nBuy with `/buy_title {tid}`",
+                inline=False
+            )
+    else:
+        embed.add_field(name="🏅 Titles", value="No titles available.", inline=False)
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
+    # ---- Consumables Section ----
+    if items:
+        embed.add_field(name="🧊 Consumables", value="\u200b", inline=False)
+        for item_id, name, price, desc in items:
+            embed.add_field(
+                name=f"{name} — {price} pts",
+                value=f"{desc}\nBuy with `/buy_freeze`" if item_id == "freeze" else f"Use ID: `{item_id}`",
+                inline=False
+            )
+    else:
+        embed.add_field(name="🧊 Consumables", value="None available.", inline=False)
 
-
-
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ------------------------------------------------------------
 # ADMIN COMMAND — Add a title to the shop
@@ -965,6 +1038,41 @@ async def set_streak_cmd(interaction: discord.Interaction, user: discord.Member,
     await interaction.response.send_message(
         f"🔥 Set **{user.display_name}**'s streak to **{amount}**.",
         ephemeral=False
+    )
+
+# ------------------------------------------------------------
+# ADMIN — Give streak freezes
+# ------------------------------------------------------------
+@tree.command(name="give_freeze", description="ADMIN: Give a user streak freezes.")
+@app_commands.describe(user="User to give freezes to", amount="Amount to give")
+async def give_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+
+    if str(interaction.user.id) != OWNER_IDS:
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    add_freeze(interaction.guild_id, user.id, amount)
+    await interaction.response.send_message(
+        f"🧊 Gave **{amount}** streak freezes to **{user.display_name}**.",
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# ADMIN — Set streak freezes
+# ------------------------------------------------------------
+@tree.command(name="set_freeze", description="ADMIN: Set exact freeze amount.")
+@app_commands.describe(user="User", amount="New amount")
+async def set_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+
+    if str(interaction.user.id) != OWNER_IDS:
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
+
+    set_freeze(interaction.guild_id, user.id, amount)
+    await interaction.response.send_message(
+        f"🧊 Set **{user.display_name}**'s streak freezes to **{amount}**.",
+        ephemeral=True
     )
 
 
@@ -1145,6 +1253,57 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
     embed.set_footer(text="Keep studying! You got this 💪")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ------------------------------------------------------------
+# /inventory — Show owned titles + streak freezes
+# ------------------------------------------------------------
+@tree.command(name="inventory", description="Show your owned titles and streak freezes.")
+@app_commands.describe(user="View someone else's inventory")
+async def inventory_cmd(interaction: discord.Interaction, user: discord.Member = None):
+
+    if user is None:
+        user = interaction.user
+
+    guild_id = interaction.guild_id
+
+    # Get titles owned
+    c.execute("""
+        SELECT titles.name
+        FROM user_titles
+        JOIN titles ON user_titles.title_id = titles.id
+        WHERE user_titles.guild_id = ? AND user_titles.user_id = ?
+    """, (guild_id, user.id))
+    titles = [row[0] for row in c.fetchall()]
+
+    # Get streak freezes
+    c.execute("SELECT freezes FROM streak_freeze WHERE guild_id = ? AND user_id = ?", (guild_id, user.id))
+    row = c.fetchone()
+    freezes = row[0] if row else 0
+
+    embed = discord.Embed(
+        title=f"🎒 Inventory for {user.display_name}",
+        color=0x00B2FF
+    )
+
+    # Titles section
+    if titles:
+        embed.add_field(
+            name="🏅 Titles Owned",
+            value="\n".join([f"[{t}]" for t in titles]),
+            inline=False
+        )
+    else:
+        embed.add_field(name="🏅 Titles Owned", value="None", inline=False)
+
+    # Freeze count
+    embed.add_field(
+        name="🧊 Streak Freezes",
+        value=f"{freezes}",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # ------------------------------------------------------------
 # /summary — Show who completed today (embed)
@@ -1442,26 +1601,58 @@ async def daily_reminder_task():
 #                  MIDNIGHT SUMMARY TASK (12 AM)
 # ============================================================
 
+# ============================================================
+#                  MIDNIGHT SUMMARY TASK (12 AM)
+# ============================================================
+
 @tasks.loop(minutes=5)
 async def midnight_task():
     now = now_cst()
     today = today_cst_str()
 
-    # Midnight window: 00:00–00:04
+    # Midnight window 00:00–00:04
     if now.hour == 0 and now.minute < 5:
+
         for guild in bot.guilds:
             settings = get_settings(guild.id)
 
-            # Avoid repeating summary each night
+            # Prevent double summary each night
             if settings.get("last_summary_date") == today:
                 continue
 
-            # Send summary + reset streaks
+            # 1. Send summary
             await send_summary_embed(guild)
-            reset_streaks_for_missed_yesterday(guild)
 
-            # Save last summary day
+            # 2. Reset streaks and detect who missed
+            missed_users = reset_streaks_for_missed_yesterday(guild)
+
+            # 3. Apply streak freeze protection
+            for member in missed_users:
+                try:
+                    freezes = get_freezes(guild.id, member.id)
+                except:
+                    freezes = 0
+
+                if freezes > 0:
+                    # Use a streak freeze instead of losing streak
+                    add_freeze(guild.id, member.id, -1)
+
+                    # Restore streak to previous (undo reset)
+                    # Previous streak = total - 1 after reset logic changes
+                    c.execute("""
+                        UPDATE streaks
+                        SET streak = streak + 1
+                        WHERE guild_id = ? AND user_id = ?
+                    """, (guild.id, member.id))
+                    conn.commit()
+
+                    # Optional: Notify channel they were protected
+                    # (Disabled by default for clean logs)
+                    # await member.send("🧊 Your streak was saved by a **Streak Freeze**!")
+
+            # 4. Mark summary completed
             upsert_settings(guild.id, last_summary_date=today)
+
 
 
 # ============================================================
@@ -1536,6 +1727,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
