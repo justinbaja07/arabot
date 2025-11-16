@@ -80,10 +80,22 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ---------- Database connection ----------
-DB = "arabic_bot.db"
+# ---------- Database connection (persistent migration for Railway) ----------
+import os, shutil
+
+ORIGINAL_DB = "arabic_bot.db"
+PERSISTENT_DB = "/data/arabic_bot.db"
+
+# If persistent DB doesn't exist yet but original does, migrate it
+if os.path.exists(ORIGINAL_DB) and not os.path.exists(PERSISTENT_DB):
+    print("Migrating existing database to Railway persistent storage...")
+    shutil.copy(ORIGINAL_DB, PERSISTENT_DB)
+
+# Always connect to persistent DB from now on
+DB = PERSISTENT_DB
 conn = sqlite3.connect(DB, check_same_thread=False)
 c = conn.cursor()
+
 
 # --------------------
 # TABLE CREATION
@@ -1568,6 +1580,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
