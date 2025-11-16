@@ -882,6 +882,95 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
     )
 
 
+# ------------------------------------------------------------
+# /stats — Show your daily progress and title
+# ------------------------------------------------------------
+@tree.command(name="stats", description="View your streak, points, and title.")
+async def stats_cmd(interaction: discord.Interaction):
+
+    guild_id = interaction.guild_id
+    user = interaction.user
+
+    streak_info = get_user_streak(guild_id, user.id)
+    points = get_points(guild_id, user.id)
+    title = get_user_title(guild_id, user.id)
+
+    embed = discord.Embed(
+        title=f"📊 Stats for {user.display_name}",
+        color=0x00B2FF
+    )
+
+    embed.add_field(name="🔥 Streak", value=f"{streak_info['streak']} days", inline=True)
+    embed.add_field(name="⭐ Points", value=f"{points}", inline=True)
+    embed.add_field(name="📘 Total Completions", value=f"{streak_info['total']}", inline=True)
+
+    if title:
+        embed.add_field(name="🏅 Title", value=f"[{title[0]}]\nColor: `{title[1]}`", inline=False)
+    else:
+        embed.add_field(name="🏅 Title", value="None", inline=False)
+
+    embed.set_footer(text="Keep studying! You got this 💪")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+
+# ------------------------------------------------------------
+# /summary — Show who completed today (embed)
+# ------------------------------------------------------------
+@tree.command(name="summary", description="Show today's completions.")
+async def summary_cmd(interaction: discord.Interaction):
+
+    guild = interaction.guild
+    rows = get_today_completions(guild.id)
+
+    embed = discord.Embed(
+        title="🌙 Daily Summary",
+        description="Here’s who completed today:",
+        color=0xFFD700
+    )
+
+    if rows:
+        for username, t in rows:
+            embed.add_field(name=username, value=f"Completed at {t}", inline=False)
+    else:
+        embed.add_field(
+            name="Nobody completed today 😭",
+            value="Try again tomorrow!",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
+
+
+# ------------------------------------------------------------
+# /leaderboard — Streak ranking (Top 10)
+# ------------------------------------------------------------
+@tree.command(name="leaderboard", description="View the top streaks.")
+async def leaderboard_cmd(interaction: discord.Interaction):
+
+    guild_id = interaction.guild_id
+    rows = get_leaderboard_streaks(guild_id, limit=10)
+
+    embed = discord.Embed(
+        title="🏆 Streak Leaderboard",
+        color=0xFFA500
+    )
+
+    if not rows:
+        embed.add_field(name="Empty", value="Nobody has streaks yet.", inline=False)
+    else:
+        rank = 1
+        for username, streak, total in rows:
+            embed.add_field(
+                name=f"#{rank} — {username}",
+                value=f"🔥 **{streak}** day streak\n📘 {total} total completions",
+                inline=False
+            )
+            rank += 1
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 # ------------------------------------------------------------
@@ -1146,6 +1235,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
