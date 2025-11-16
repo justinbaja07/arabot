@@ -727,34 +727,6 @@ CREATE TABLE IF NOT EXISTS streak_freeze (
 """)
 conn.commit()
 
-
-def get_freezes(guild_id: int, user_id: int):
-    c.execute("SELECT freezes FROM streak_freeze WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-    row = c.fetchone()
-    return row[0] if row else 0
-
-
-def add_freeze(guild_id: int, user_id: int, amount: int):
-    c.execute("""
-        INSERT INTO streak_freeze (guild_id, user_id, freezes)
-        VALUES (?, ?, ?)
-        ON CONFLICT(guild_id, user_id)
-        DO UPDATE SET freezes = freezes + EXCLUDED.freezes
-    """, (guild_id, user_id, amount))
-    conn.commit()
-
-
-def set_freeze(guild_id: int, user_id: int, amount: int):
-    c.execute("""
-        INSERT INTO streak_freeze (guild_id, user_id, freezes)
-        VALUES (?, ?, ?)
-        ON CONFLICT(guild_id, user_id)
-        DO UPDATE SET freezes = EXCLUDED.freezes
-    """, (guild_id, user_id, amount))
-    conn.commit()
-
-
-
 # ----------------------------------------
 # AUTO COLOR ROLE SYSTEM
 # ----------------------------------------
@@ -916,50 +888,42 @@ async def points_cmd(interaction: discord.Interaction):
 
 
 # ------------------------------------------------------------
-# /shop — unified shop (titles + consumables)
+# /shop — list purchasable items
 # ------------------------------------------------------------
-@tree.command(name="shop", description="View the title shop and consumables.")
+@tree.command(name="shop", description="View the shop.")
 async def shop_cmd(interaction: discord.Interaction):
-
-    # Load titles
-    titles = list_titles()  # returns (id, name, price)
-
-    # Load consumables from shop_items
-    c.execute("SELECT id, name, price, description FROM shop_items ORDER BY price ASC")
-    items = c.fetchall()
+    rows = list_titles()
 
     embed = discord.Embed(
         title="🏪 Shop",
-        description="Available items you can buy",
+        description="Buy titles or streak freezes.",
         color=0x00B2FF
     )
 
-    # ---- Titles Section ----
-    if titles:
-        embed.add_field(name="🏅 Titles", value="\u200b", inline=False)
-        for tid, name, price in titles:  # FIXED unpacking (3 values)
+    # Titles
+    if rows:
+        for tid, name, price in rows:
             embed.add_field(
                 name=f"[{name}] — {price} pts",
-                value=f"ID: `{tid}`\nBuy with `/buy_title {tid}`",
+                value=f"ID: `{tid}`",
                 inline=False
             )
     else:
-        embed.add_field(name="🏅 Titles", value="No titles available.", inline=False)
+        embed.add_field(
+            name="No titles available",
+            value="Admins can add titles.",
+            inline=False
+        )
 
-    # ---- Consumables Section ----
-    if items:
-        embed.add_field(name="🧊 Consumables", value="\u200b", inline=False)
-        for item_id, name, price, desc in items:
-            embed.add_field(
-                name=f"{name} — {price} pts",
-                value=f"{desc}\nBuy with `/buy_freeze`" if item_id == "freeze"
-                       else f"Use ID: `{item_id}`",
-                inline=False
-            )
-    else:
-        embed.add_field(name="🧊 Consumables", value="None available.", inline=False)
+    # Freeze item
+    embed.add_field(
+        name="🧊 Streak Freeze — 100 pts",
+        value="ID: `freeze`\nProtects your streak if you miss 1 day.",
+        inline=False
+    )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 # ------------------------------------------------------------
 # ADMIN COMMAND — Add a title to the shop
@@ -1042,37 +1006,34 @@ async def set_streak_cmd(interaction: discord.Interaction, user: discord.Member,
     )
 
 # ------------------------------------------------------------
-# ADMIN: GIVE STREAK FREEZE
+# ADMIN: give freeze
 # ------------------------------------------------------------
-@tree.command(name="give_freeze", description="Admin: give a user streak freezes.")
+@tree.command(name="give_freeze", description="(Admin) Give streak freezes to a user.")
 async def give_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not is_owner(interaction.user.id):
+        return await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
 
-    if str(interaction.user.id) not in OWNER_IDS:
-        await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
-        return
-
-    add_freeze(interaction.guild_id, user.id, amount)
+    add_freezes(interaction.guild_id, user.id, amount)
     await interaction.response.send_message(
-        f"✅ Gave **{amount}** streak freeze(s) to **{user.display_name}**.",
+        f"🧊 Gave **{amount}** freezes to {user.display_name}.",
         ephemeral=True
     )
 
 
 # ------------------------------------------------------------
-# ADMIN: SET STREAK FREEZE
+# ADMIN: set freeze
 # ------------------------------------------------------------
-@tree.command(name="set_freeze", description="Admin: set a user's streak freezes.")
+@tree.command(name="set_freeze", description="(Admin) Set a user's streak freezes.")
 async def set_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not is_owner(interaction.user.id):
+        return await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
 
-    if str(interaction.user.id) not in OWNER_IDS:
-        await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
-        return
-
-    set_user_freeze(interaction.guild_id, user.id, amount)
+    set_freezes(interaction.guild_id, user.id, amount)
     await interaction.response.send_message(
-        f"✅ Set **{user.display_name}** to **{amount}** streak freezes.",
+        f"🧊 Set {user.display_name}'s freezes to **{amount}**.",
         ephemeral=True
     )
+
 
 # ------------------------------------------------------------
 # /buy_title — purchase a title by ID
@@ -1154,19 +1115,27 @@ async def inventory_cmd(interaction: discord.Interaction, user: Optional[discord
 # ------------------------------------------------------------
 # /equiptitle — equip one of your owned titles
 # ------------------------------------------------------------
-@tree.command(name="equiptitle", description="Equip a title you own by ID.")
-@app_commands.describe(title_id="ID from /shop or /inventory")
-async def equip_title_cmd(interaction: discord.Interaction, title_id: int):
+@tree.command(name="equiptitle", description="Equip one of your owned titles.")
+async def equiptitle_cmd(interaction: discord.Interaction, title_id: int):
     guild_id = interaction.guild_id
-    user = interaction.user
+    user_id = interaction.user.id
 
-    # Check ownership
-    if not user_owns_title(guild_id, user.id, title_id):
-        await interaction.response.send_message("❌ You do not own that title.", ephemeral=True)
-        return
+    # verify they own this title
+    owned = [t[0] for t in get_user_all_titles(guild_id, user_id)]
+    if title_id not in owned:
+        return await interaction.response.send_message(
+            "❌ You don't own that title.",
+            ephemeral=True
+        )
 
-    equip_title_db(guild_id, user.id, title_id)
-    await interaction.response.send_message(f"✅ Equipped title id `{title_id}`.", ephemeral=True)
+    set_user_title(guild_id, user_id, title_id)
+    t = get_title_by_id(title_id)
+
+    await interaction.response.send_message(
+        f"🏅 Equipped title: **[{t[1]}]**",
+        ephemeral=True
+    )
+
 
 
 # ------------------------------------------------------------
@@ -1252,52 +1221,32 @@ async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Mem
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ------------------------------------------------------------
-# /inventory — Show owned titles + streak freezes
+# /inventory — Show inventory (self or another user)
 # ------------------------------------------------------------
-@tree.command(name="inventory", description="Show your owned titles and streak freezes.")
-@app_commands.describe(user="View someone else's inventory")
-async def inventory_cmd(interaction: discord.Interaction, user: discord.Member = None):
-
-    if user is None:
-        user = interaction.user
-
+@tree.command(name="stats", description="View your stats or another user's.")
+async def stats_cmd(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
     guild_id = interaction.guild_id
 
-    # Get titles owned
-    c.execute("""
-        SELECT titles.name
-        FROM user_titles
-        JOIN titles ON user_titles.title_id = titles.id
-        WHERE user_titles.guild_id = ? AND user_titles.user_id = ?
-    """, (guild_id, user.id))
-    titles = [row[0] for row in c.fetchall()]
-
-    # Get streak freezes
-    c.execute("SELECT freezes FROM streak_freeze WHERE guild_id = ? AND user_id = ?", (guild_id, user.id))
-    row = c.fetchone()
-    freezes = row[0] if row else 0
+    streak_info = get_user_streak(guild_id, user.id)
+    points = get_points(guild_id, user.id)
+    title = get_user_title(guild_id, user.id)
+    freezes = get_freeze_count(guild_id, user.id)
 
     embed = discord.Embed(
-        title=f"🎒 Inventory for {user.display_name}",
+        title=f"📊 Stats for {user.display_name}",
         color=0x00B2FF
     )
 
-    # Titles section
-    if titles:
-        embed.add_field(
-            name="🏅 Titles Owned",
-            value="\n".join([f"[{t}]" for t in titles]),
-            inline=False
-        )
-    else:
-        embed.add_field(name="🏅 Titles Owned", value="None", inline=False)
+    embed.add_field(name="🔥 Streak", value=f"{streak_info['streak']} days", inline=True)
+    embed.add_field(name="⭐ Points", value=f"{points}", inline=True)
+    embed.add_field(name="📘 Total Completions", value=f"{streak_info['total']}", inline=True)
+    embed.add_field(name="🧊 Freezes", value=f"{freezes}", inline=True)
 
-    # Freeze count
-    embed.add_field(
-        name="🧊 Streak Freezes",
-        value=f"{freezes}",
-        inline=False
-    )
+    if title:
+        embed.add_field(name="🏅 Equipped Title", value=f"[{title[0]}]", inline=False)
+    else:
+        embed.add_field(name="🏅 Equipped Title", value="None", inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1724,6 +1673,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
