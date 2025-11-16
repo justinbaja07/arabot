@@ -490,11 +490,28 @@ async def send_summary_embed(guild: discord.Guild):
 
     await channel.send(embed=embed)
 
+        # ----------------------------------------
+# POINTS SYSTEM
+# ----------------------------------------
+
+def add_points(guild_id: int, user_id: int, amount: int):
+    c.execute("""
+        INSERT INTO points (guild_id, user_id, points)
         VALUES (?, ?, ?)
         ON CONFLICT(guild_id, user_id)
         DO UPDATE SET points = points + EXCLUDED.points
     """, (guild_id, user_id, amount))
     conn.commit()
+
+
+def get_points(guild_id: int, user_id: int):
+    c.execute(
+        "SELECT points FROM points WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id)
+    )
+    row = c.fetchone()
+    return row[0] if row else 0
+
 
 def get_points(guild_id: int, user_id: int):
     c.execute("SELECT points FROM points WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
@@ -1280,6 +1297,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
