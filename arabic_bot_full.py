@@ -775,35 +775,28 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
         await interaction.response.send_message("❌ You do not have enough points.", ephemeral=True)
         return
 
-    # Success → apply role
+        # Success → apply role
     c.execute("SELECT name, color FROM titles WHERE id = ?", (title_id,))
     row = c.fetchone()
     name, color = row
 
-            try:
+    try:
         member = interaction.guild.get_member(user.id)
         if member is None:
             member = await interaction.guild.fetch_member(user.id)
         await apply_title_color(member, color, name)
     except Exception:
         await interaction.response.send_message(
-            f"⚠️ Title purchased but color assignment failed (role creation/assignment).",
+            "⚠️ Title purchased but color assignment failed (role creation/assignment).",
             ephemeral=True
         )
-        return
-
-        # guard: sometimes member can be None
-        if member is None:
-            member = await interaction.guild.fetch_member(user.id)
-        await apply_title_color(member, color, name)
-    except Exception:
-        await interaction.response.send_message(f"⚠️ Title purchased but color assignment failed (role creation/assignment).", ephemeral=True)
         return
 
     await interaction.response.send_message(
         f"🎉 You bought the title **[{name}]**!",
         ephemeral=False
     )
+
 
 
 
@@ -999,6 +992,7 @@ async def midnight_task():
             upsert_settings(guild.id, last_summary_date=today)
 
 
+
 @tasks.loop(seconds=10)
 async def _challenge_sweeper():
     """Remove expired challenges to keep memory clean and notify channels if needed."""
@@ -1056,6 +1050,7 @@ async def on_ready():
 
 
 
+
 # ============================================================
 #                        BOOTSTRAP
 # ============================================================
@@ -1066,6 +1061,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
