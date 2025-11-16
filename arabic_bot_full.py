@@ -458,16 +458,27 @@ async def send_summary_embed(guild: discord.Guild):
 
     if rows:
         for username, t in rows:
-            name = username
-member = interaction.guild.get_member_named(username)
-if member:
-    name = get_display_name_with_title(interaction.guild_id, member)
 
-embed.add_field(name=name, value=f"Completed at {t}", inline=False)
+            # Try to get the actual member to display title
+            member = guild.get_member_named(username)
+            if member:
+                name = get_display_name_with_title(guild.id, member)
+            else:
+                name = username  # fallback
 
+            embed.add_field(
+                name=name,
+                value=f"Completed at {t}",
+                inline=False
+            )
     else:
-        embed.add_field(name="Nobody completed today 😭", value="Try again tomorrow!", inline=False)
+        embed.add_field(
+            name="Nobody completed today 😭",
+            value="Try again tomorrow!",
+            inline=False
+        )
 
+    # Get summary channel
     settings = get_settings(guild.id)
     channel_id = settings.get("channel_id")
     if not channel_id:
@@ -479,15 +490,6 @@ embed.add_field(name=name, value=f"Completed at {t}", inline=False)
 
     await channel.send(embed=embed)
 
-
-
-# ----------------------------------------
-# POINTS SYSTEM
-# ----------------------------------------
-
-def add_points(guild_id: int, user_id: int, amount: int):
-    c.execute("""
-        INSERT INTO points (guild_id, user_id, points)
         VALUES (?, ?, ?)
         ON CONFLICT(guild_id, user_id)
         DO UPDATE SET points = points + EXCLUDED.points
@@ -1278,6 +1280,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
