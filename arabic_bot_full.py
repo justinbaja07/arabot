@@ -155,7 +155,6 @@ c.execute("""
 CREATE TABLE IF NOT EXISTS titles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE,
-    color TEXT,
     price INTEGER
 )
 """)
@@ -523,20 +522,22 @@ def get_points(guild_id: int, user_id: int):
 # TITLES SYSTEM
 # ----------------------------------------
 
-def create_title(name: str, color: str, price: int):
+def create_title(name: str, price: int):
     try:
         c.execute("""
-            INSERT INTO titles (name, color, price)
-            VALUES (?, ?, ?)
-        """, (name, color, price))
+            INSERT INTO titles (name, price)
+            VALUES (?, ?)
+        """, (name, price))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
         return False
 
+
 def list_titles():
-    c.execute("SELECT id, name, color, price FROM titles ORDER BY price ASC")
+    c.execute("SELECT id, name, price FROM titles ORDER BY price ASC")
     return c.fetchall()
+
 
 def get_user_title(guild_id: int, user_id: int):
     c.execute("""
@@ -742,15 +743,29 @@ async def shop_cmd(interaction: discord.Interaction):
     rows = list_titles()
     if not rows:
         await interaction.response.send_message(
-            "Shop is empty. Admins can add titles with `create_title` (or set OWNER_IDS environment).",
+            "Shop is empty. Admins can add titles with `/add_title`.",
             ephemeral=True
         )
         return
 
-    embed = discord.Embed(title="🏪 Title Shop", description="Available titles", color=0x00B2FF)
-    for tid, name, color, price in rows:
-        embed.add_field(name=f"[{name}] — {price} pts", value=f"Color: `{color}` — id: `{tid}`", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed = discord.Embed(
+        title="🏪 Title Shop",
+        description="Available titles",
+        color=0x00B2FF
+    )
+
+    for tid, name, price in rows:
+        embed.add_field(
+            name=f"[{name}] — {price} pts",
+            value=f"id: `{tid}`",
+            inline=False
+        )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
 
 
 
@@ -759,13 +774,13 @@ async def shop_cmd(interaction: discord.Interaction):
 # ------------------------------------------------------------
 @tree.command(name="add_title", description="Admin: create a new title for the shop.")
 @app_commands.describe(name="Title name", color="Hex color (#RRGGBB)", price="Point cost")
-async def add_title_cmd(interaction: discord.Interaction, name: str, color: str, price: int):
+async def add_title_cmd(interaction: discord.Interaction, name: str, price: int):
 
     if interaction.user.id not in OWNER_IDS:
         await interaction.response.send_message("❌ No permission.", ephemeral=True)
         return
 
-    ok = create_title(name, color, price)
+    ok = create_title(name, price)
 
     if not ok:
         await interaction.response.send_message("❌ Title already exists.", ephemeral=True)
@@ -1299,6 +1314,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
