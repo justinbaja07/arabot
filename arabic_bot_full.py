@@ -168,7 +168,50 @@ CREATE TABLE IF NOT EXISTS user_titles (
 )
 """)
 
-conn.commit()
+# --------------------
+# INVENTORY & FREEZE TABLES (NEW)
+# --------------------
+
+# Multi-owner titles (allow many titles per user)
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_titles_multi (
+    guild_id INTEGER,
+    user_id INTEGER,
+    title_id INTEGER,
+    PRIMARY KEY (guild_id, user_id, title_id)
+)
+""")
+
+# Equipped title (which title the user currently wears — at most one)
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_equipped_titles (
+    guild_id INTEGER,
+    user_id INTEGER,
+    title_id INTEGER,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+# Streak freeze counts
+c.execute("""
+CREATE TABLE IF NOT EXISTS streak_freezes (
+    guild_id INTEGER,
+    user_id INTEGER,
+    freezes INTEGER DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+)
+""")
+
+# Migrate any existing single-title rows from old user_titles to user_titles_multi (safe no-op if user_titles empty)
+try:
+    c.execute("""
+        INSERT OR IGNORE INTO user_titles_multi (guild_id, user_id, title_id)
+        SELECT guild_id, user_id, title_id FROM user_titles
+    """)
+    conn.commit()
+except Exception:
+    # migration best-effort; ignore if structure differs
+    pass
 
 # --------------------
 # EMBEDDING MODEL LOAD
@@ -282,12 +325,19 @@ def reset_streaks_for_missed_yesterday(guild: discord.Guild):
     missed = []
     for m in tracked:
         if m.id not in done_ids:
+            # If user has a freeze, consume it and keep streak intact
+            if consume_freeze_if_available(guild.id, m.id):
+                # consume_freeze_if_available already decremented DB; leave streak as-is
+                continue
+
+            # otherwise reset streak
             c.execute("INSERT OR IGNORE INTO streaks (guild_id, user_id, username, streak, last_done_date, total_completions) VALUES (?, ?, ?, ?, ?, ?)",
                       (guild.id, m.id, str(m), 0, None, 0))
             c.execute("UPDATE streaks SET streak = 0 WHERE guild_id = ? AND user_id = ?", (guild.id, m.id))
             missed.append(m)
     conn.commit()
     return missed
+
 
 # --------------------
 # END OF QUADRANT 1
@@ -539,16 +589,84 @@ def list_titles():
     return c.fetchall()
 
 
-def get_user_title(guild_id: int, user_id: int):
+# --------------------
+# INVENTORY / EQUIP / FREEZE HELPERS
+# --------------------
+
+def add_title_to_user(guild_id: int, user_id: int, title_id: int):
+    """Give title ownership to user (doesn't equip)."""
     c.execute("""
-        SELECT titles.name FROM user_titles
-        JOIN titles ON user_titles.title_id = titles.id
-        WHERE guild_id = ? AND user_id = ?
+        INSERT OR IGNORE INTO user_titles_multi (guild_id, user_id, title_id)
+        VALUES (?, ?, ?)
+    """, (guild_id, user_id, title_id))
+    conn.commit()
+
+def user_owns_title(guild_id: int, user_id: int, title_id: int) -> bool:
+    c.execute("""
+        SELECT 1 FROM user_titles_multi WHERE guild_id = ? AND user_id = ? AND title_id = ?
+    """, (guild_id, user_id, title_id))
+    return c.fetchone() is not None
+
+def get_user_titles(guild_id: int, user_id: int):
+    """Return list of (title_id, title_name, price)."""
+    c.execute("""
+        SELECT t.id, t.name, t.price
+        FROM user_titles_multi ut
+        JOIN titles t ON ut.title_id = t.id
+        WHERE ut.guild_id = ? AND ut.user_id = ?
+        ORDER BY t.price ASC
+    """, (guild_id, user_id))
+    return c.fetchall()
+
+def equip_title_db(guild_id: int, user_id: int, title_id: int):
+    """Equip a title for user (one equipped per user)."""
+    c.execute("""
+        INSERT OR REPLACE INTO user_equipped_titles (guild_id, user_id, title_id)
+        VALUES (?, ?, ?)
+    """, (guild_id, user_id, title_id))
+    conn.commit()
+
+def get_equipped_title(guild_id: int, user_id: int):
+    c.execute("""
+        SELECT t.name FROM user_equipped_titles ue
+        JOIN titles t ON ue.title_id = t.id
+        WHERE ue.guild_id = ? AND ue.user_id = ?
     """, (guild_id, user_id))
     row = c.fetchone()
-    return row  # (name,) or None
+    return row[0] if row else None
 
+# STREAK FREEZE HELPERS
+def get_freeze_count(guild_id: int, user_id: int) -> int:
+    c.execute("SELECT freezes FROM streak_freezes WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    row = c.fetchone()
+    return int(row[0]) if row else 0
 
+def add_freezes(guild_id: int, user_id: int, amount: int):
+    c.execute("""
+        INSERT INTO streak_freezes (guild_id, user_id, freezes)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET freezes = freezes + excluded.freezes
+    """, (guild_id, user_id, amount))
+    conn.commit()
+
+def set_freezes(guild_id: int, user_id: int, amount: int):
+    c.execute("""
+        INSERT INTO streak_freezes (guild_id, user_id, freezes)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id)
+        DO UPDATE SET freezes = excluded.freezes
+    """, (guild_id, user_id, amount))
+    conn.commit()
+
+def consume_freeze_if_available(guild_id: int, user_id: int) -> bool:
+    """If freeze >0, decrement and return True, else False."""
+    cnt = get_freeze_count(guild_id, user_id)
+    if cnt and cnt > 0:
+        c.execute("UPDATE streak_freezes SET freezes = freezes - 1 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        conn.commit()
+        return True
+    return False
 
 def purchase_title(guild_id: int, user_id: int, title_id: int):
     # Get title price
@@ -567,11 +685,8 @@ def purchase_title(guild_id: int, user_id: int, title_id: int):
     c.execute("UPDATE points SET points = points - ? WHERE guild_id = ? AND user_id = ?",
               (price, guild_id, user_id))
 
-    # Assign title
-    c.execute("""
-        INSERT OR REPLACE INTO user_titles (guild_id, user_id, title_id)
-        VALUES (?, ?, ?)
-    """, (guild_id, user_id, title_id))
+    # Add to inventory (multi ownership)
+    add_title_to_user(guild_id, user_id, title_id)
 
     conn.commit()
     return "OK"
@@ -875,78 +990,161 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
         await interaction.response.send_message("❌ You do not have enough points.", ephemeral=True)
         return
 
-        # Success → apply role
+      # Success → add to inventory (no role changes)
     c.execute("SELECT name FROM titles WHERE id = ?", (title_id,))
     row = c.fetchone()
-    name = row[0]
+    if row:
+        name = row[0]
+    else:
+        await interaction.response.send_message("⚠️ Title purchased but title record missing.", ephemeral=True)
+        return
 
+    # Add to user's inventory (purchase_title already did this, but ensure idempotent)
+    add_title_to_user(guild_id, user.id, title_id)
 
-    
     await interaction.response.send_message(
-        f"🎉 You bought the title **[{name}]**!",
+        f"🎉 You bought the title **[{name}]**! Use `/equiptitle {title_id}` to wear it.",
         ephemeral=False
     )
 
 def get_display_name_with_title(guild_id: int, user: discord.Member):
-    title = get_user_title(guild_id, user.id)
-    if title:
-        return f"[{title[0]}] {user.display_name}"
+    title_name = get_equipped_title(guild_id, user.id)
+    if title_name:
+        return f"[{title_name}] {user.display_name}"
     return user.display_name
+
+
+# ------------------------------------------------------------
+# /inventory — show owned titles & freezes (user optional)
+# ------------------------------------------------------------
+@tree.command(name="inventory", description="Show your inventory or another user's inventory.")
+@app_commands.describe(user="Optional user to view")
+async def inventory_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    guild_id = interaction.guild_id
+
+    titles = get_user_titles(guild_id, target.id)
+    equipped = get_equipped_title(guild_id, target.id)
+    freezes = get_freeze_count(guild_id, target.id)
+
+    embed = discord.Embed(
+        title=f"📦 Inventory — {target.display_name}",
+        color=0x00B2FF
+    )
+
+    embed.add_field(name="🧊 Streak Freezes", value=str(freezes), inline=False)
+
+    if titles:
+        lines = []
+        for tid, name, price in titles:
+            mark = " (equipped)" if equipped and name == equipped else ""
+            lines.append(f"`{tid}` — **{name}** — {price} pts{mark}")
+        embed.add_field(name="🏷️ Titles", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="🏷️ Titles", value="None", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ------------------------------------------------------------
+# /equiptitle — equip one of your owned titles
+# ------------------------------------------------------------
+@tree.command(name="equiptitle", description="Equip a title you own by ID.")
+@app_commands.describe(title_id="ID from /shop or /inventory")
+async def equip_title_cmd(interaction: discord.Interaction, title_id: int):
+    guild_id = interaction.guild_id
+    user = interaction.user
+
+    # Check ownership
+    if not user_owns_title(guild_id, user.id, title_id):
+        await interaction.response.send_message("❌ You do not own that title.", ephemeral=True)
+        return
+
+    equip_title_db(guild_id, user.id, title_id)
+    await interaction.response.send_message(f"✅ Equipped title id `{title_id}`.", ephemeral=True)
+
+
+# ------------------------------------------------------------
+# /buy_freeze — buy a streak freeze (cost 100 pts)
+# ------------------------------------------------------------
+@tree.command(name="buy_freeze", description="Buy a streak freeze (prevents a missed day from breaking streak).")
+async def buy_freeze_cmd(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    user = interaction.user
+
+    cost = 100  # as requested
+
+    pts = get_points(guild_id, user.id)
+    if pts < cost:
+        await interaction.response.send_message("❌ Not enough points to buy a streak freeze.", ephemeral=True)
+        return
+
+    # Deduct and add freeze
+    add_points(guild_id, user.id, -cost)  # uses add_points which increments (we pass negative)
+    add_freezes(guild_id, user.id, 1)
+
+    await interaction.response.send_message(f"🧊 You bought a Streak Freeze for {cost} pts! Use is automatic if you miss a day.", ephemeral=True)
+
+
+# ------------------------------------------------------------
+# ADMIN: give_freeze & set_freeze
+# ------------------------------------------------------------
+@tree.command(name="give_freeze", description="Admin: give a streak freeze to a user.")
+@app_commands.describe(user="User to modify", amount="How many to give")
+async def give_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    add_freezes(interaction.guild_id, user.id, amount)
+    await interaction.response.send_message(f"✅ Gave {amount} streak freeze(s) to {user.display_name}.", ephemeral=True)
+
+
+@tree.command(name="set_freeze", description="Admin: set a user's streak freeze count.")
+@app_commands.describe(user="User to modify", amount="New freeze amount")
+async def set_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    set_freezes(interaction.guild_id, user.id, amount)
+    await interaction.response.send_message(f"✅ Set {user.display_name}'s streak freezes to {amount}.", ephemeral=True)
 
 
 # ------------------------------------------------------------
 # /stats — Show your daily progress and title
 # ------------------------------------------------------------
-@tree.command(name="stats", description="View your streak, points, and title.")
-async def stats_cmd(interaction: discord.Interaction):
+@tree.command(name="stats", description="View your streak, points, title, and freezes.")
+@app_commands.describe(user="Optional user to view")
+async def stats_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
 
+    target = user or interaction.user
     guild_id = interaction.guild_id
-    user = interaction.user
 
-    streak_info = get_user_streak(guild_id, user.id)
-    points = get_points(guild_id, user.id)
-    title = get_user_title(guild_id, user.id)
+    streak_info = get_user_streak(guild_id, target.id)
+    points = get_points(guild_id, target.id)
+    title = get_equipped_title(guild_id, target.id)
+    freezes = get_freeze_count(guild_id, target.id)
 
     embed = discord.Embed(
-        title=f"📊 Stats for {user.display_name}",
+        title=f"📊 Stats for {target.display_name}",
         color=0x00B2FF
     )
 
-    embed.add_field(
-        name="🔥 Streak",
-        value=f"{streak_info['streak']} days",
-        inline=True
-    )
-    embed.add_field(
-        name="⭐ Points",
-        value=f"{points}",
-        inline=True
-    )
-    embed.add_field(
-        name="📘 Total Completions",
-        value=f"{streak_info['total']}",
-        inline=True
-    )
+    embed.add_field(name="🔥 Streak", value=f"{streak_info['streak']} days", inline=True)
+    embed.add_field(name="⭐ Points", value=f"{points}", inline=True)
+    embed.add_field(name="📘 Total Completions", value=f"{streak_info['total']}", inline=True)
 
-    # TITLE FIELD (no color version)
     if title:
-        embed.add_field(
-            name="🏅 Title",
-            value=f"[{title[0]}]",
-            inline=False
-        )
+        embed.add_field(name="🏅 Title", value=f"[{title}]", inline=False)
     else:
-        embed.add_field(
-            name="🏅 Title",
-            value="None",
-            inline=False
-        )
+        embed.add_field(name="🏅 Title", value="None", inline=False)
+
+    embed.add_field(name="🧊 Streak Freezes", value=str(freezes), inline=False)
 
     embed.set_footer(text="Keep studying! You got this 💪")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 
 # ------------------------------------------------------------
 # /summary — Show who completed today (embed)
@@ -1338,6 +1536,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
