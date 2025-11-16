@@ -86,6 +86,9 @@ import os, shutil
 ORIGINAL_DB = "arabic_bot.db"
 PERSISTENT_DB = "/data/arabic_bot.db"
 
+# Ensure the persistent directory exists (Railway fix)
+os.makedirs("/data", exist_ok=True)
+
 # If persistent DB doesn't exist yet but original does, migrate it
 if os.path.exists(ORIGINAL_DB) and not os.path.exists(PERSISTENT_DB):
     print("Migrating existing database to Railway persistent storage...")
@@ -1580,6 +1583,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
