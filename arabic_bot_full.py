@@ -28,7 +28,7 @@ POINTS_PER_CORRECT = 5
 
 # Admin helpers: set OWNER_IDS env var to a comma-separated list of Discord IDs,
 # or the code will fall back to username checks below.
-OWNER_IDS = "848935997358211122"
+OWNER_IDS = [848935997358211122]
 _owner_env = os.getenv("OWNER_IDS", "")
 if _owner_env:
     for part in _owner_env.split(","):
@@ -1062,6 +1062,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
