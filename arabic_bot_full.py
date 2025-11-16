@@ -780,8 +780,18 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
     row = c.fetchone()
     name, color = row
 
-        try:
+            try:
         member = interaction.guild.get_member(user.id)
+        if member is None:
+            member = await interaction.guild.fetch_member(user.id)
+        await apply_title_color(member, color, name)
+    except Exception:
+        await interaction.response.send_message(
+            f"⚠️ Title purchased but color assignment failed (role creation/assignment).",
+            ephemeral=True
+        )
+        return
+
         # guard: sometimes member can be None
         if member is None:
             member = await interaction.guild.fetch_member(user.id)
@@ -974,14 +984,20 @@ async def daily_reminder_task():
 @tasks.loop(minutes=5)
 async def midnight_task():
     now = now_cst()
+    today = today_cst_str()
 
-    # Runs one time between 12:00–12:05 AM CST
-    if now.hour == 0 and now.minute < 5:
-        for guild in bot.guilds:
+    for guild in bot.guilds:
+        settings = get_settings(guild.id)
+
+        # Prevent double summary
+        if settings.get("last_summary_date") == today:
+            continue
+
+        if now.hour == 0 and now.minute < 5:
             await send_summary_embed(guild)
             reset_streaks_for_missed_yesterday(guild)
+            upsert_settings(guild.id, last_summary_date=today)
 
-        await asyncio.sleep(60)  # prevent double firing
 
 @tasks.loop(seconds=10)
 async def _challenge_sweeper():
@@ -1001,7 +1017,7 @@ async def _challenge_sweeper():
 
 
 # ============================================================
-#                          ON READY (PATCHED)
+#                          ON READY (FULLY PATCHED)
 # ============================================================
 
 @bot.event
@@ -1022,23 +1038,22 @@ async def on_ready():
     except Exception as e:
         print("Sync error:", e)
 
-# Start tasks
-try:
-    if not daily_reminder_task.is_running():
-        daily_reminder_task.start()
+    # Start tasks
+    try:
+        if not daily_reminder_task.is_running():
+            daily_reminder_task.start()
 
-    if not midnight_task.is_running():
-        midnight_task.start()
+        if not midnight_task.is_running():
+            midnight_task.start()
 
-    # PATCH: Start the challenge sweeper (runs every 10 seconds)
-    if not _challenge_sweeper.is_running():
-        _challenge_sweeper.start()
+        if not _challenge_sweeper.is_running():
+            _challenge_sweeper.start()
 
-except Exception as e:
-    print("Task start error:", e)
-
+    except Exception as e:
+        print("Task start error:", e)
 
     print("Bot is fully ready.")
+
 
 
 # ============================================================
@@ -1051,6 +1066,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
