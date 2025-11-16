@@ -541,11 +541,13 @@ def list_titles():
 
 def get_user_title(guild_id: int, user_id: int):
     c.execute("""
-        SELECT titles.name, titles.color FROM user_titles
+        SELECT titles.name FROM user_titles
         JOIN titles ON user_titles.title_id = titles.id
         WHERE guild_id = ? AND user_id = ?
     """, (guild_id, user_id))
-    return c.fetchone()
+    row = c.fetchone()
+    return row  # row = (title_name,) or None
+
 
 def purchase_title(guild_id: int, user_id: int, title_id: int):
     # Get title price
@@ -773,7 +775,7 @@ async def shop_cmd(interaction: discord.Interaction):
 # ADMIN COMMAND — Add a title to the shop
 # ------------------------------------------------------------
 @tree.command(name="add_title", description="Admin: create a new title for the shop.")
-@app_commands.describe(name="Title name", color="Hex color (#RRGGBB)", price="Point cost")
+@app_commands.describe(name="Title name", price="Point cost")
 async def add_title_cmd(interaction: discord.Interaction, name: str, price: int):
 
     if interaction.user.id not in OWNER_IDS:
@@ -787,9 +789,10 @@ async def add_title_cmd(interaction: discord.Interaction, name: str, price: int)
         return
 
     await interaction.response.send_message(
-        f"🏷️ **Title created!**\nName: **{name}**\nColor: `{color}`\nPrice: **{price} pts**",
+        f"🏷️ **Title created!**\nName: **{name}**\nPrice: **{price} pts**",
         ephemeral=False
     )
+
 
 
 
@@ -874,9 +877,10 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
         return
 
         # Success → apply role
-    c.execute("SELECT name, color FROM titles WHERE id = ?", (title_id,))
+    c.execute("SELECT name FROM titles WHERE id = ?", (title_id,))
     row = c.fetchone()
-    name, color = row
+    name = row[0]
+
 
     
     await interaction.response.send_message(
@@ -913,10 +917,11 @@ async def stats_cmd(interaction: discord.Interaction):
     embed.add_field(name="⭐ Points", value=f"{points}", inline=True)
     embed.add_field(name="📘 Total Completions", value=f"{streak_info['total']}", inline=True)
 
-    if title:
-        embed.add_field(name="🏅 Title", value=f"[{title[0]}]\nColor: `{title[1]}`", inline=False)
+        if title:
+        embed.add_field(name="🏅 Title", value=f"[{title[0]}]", inline=False)
     else:
         embed.add_field(name="🏅 Title", value="None", inline=False)
+
 
     embed.set_footer(text="Keep studying! You got this 💪")
 
@@ -1314,6 +1319,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
