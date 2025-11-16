@@ -922,7 +922,7 @@ async def points_cmd(interaction: discord.Interaction):
 async def shop_cmd(interaction: discord.Interaction):
 
     # Load titles
-    titles = list_titles()
+    titles = list_titles()  # returns (id, name, price)
 
     # Load consumables from shop_items
     c.execute("SELECT id, name, price, description FROM shop_items ORDER BY price ASC")
@@ -937,7 +937,7 @@ async def shop_cmd(interaction: discord.Interaction):
     # ---- Titles Section ----
     if titles:
         embed.add_field(name="🏅 Titles", value="\u200b", inline=False)
-        for tid, name, color, price in titles:
+        for tid, name, price in titles:  # FIXED unpacking (3 values)
             embed.add_field(
                 name=f"[{name}] — {price} pts",
                 value=f"ID: `{tid}`\nBuy with `/buy_title {tid}`",
@@ -952,7 +952,8 @@ async def shop_cmd(interaction: discord.Interaction):
         for item_id, name, price, desc in items:
             embed.add_field(
                 name=f"{name} — {price} pts",
-                value=f"{desc}\nBuy with `/buy_freeze`" if item_id == "freeze" else f"Use ID: `{item_id}`",
+                value=f"{desc}\nBuy with `/buy_freeze`" if item_id == "freeze"
+                       else f"Use ID: `{item_id}`",
                 inline=False
             )
     else:
@@ -1723,6 +1724,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
