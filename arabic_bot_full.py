@@ -213,6 +213,14 @@ except Exception:
     # migration best-effort; ignore if structure differs
     pass
 
+# --- PATCH: Ensure last_summary_date column exists ---
+try:
+    c.execute("ALTER TABLE settings ADD COLUMN last_summary_date TEXT")
+    conn.commit()
+except:
+    pass
+
+
 # --------------------
 # EMBEDDING MODEL LOAD
 # --------------------
@@ -935,6 +943,34 @@ async def set_points_cmd(interaction: discord.Interaction, user: discord.Member,
     )
 
 
+@tree.command(name="remove_title", description="Admin: remove a title from the shop.")
+@app_commands.describe(title_id="The ID of the title to remove")
+async def remove_title_cmd(interaction: discord.Interaction, title_id: int):
+
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    # Check existence
+    c.execute("SELECT name FROM titles WHERE id = ?", (title_id,))
+    row = c.fetchone()
+
+    if not row:
+        await interaction.response.send_message("❌ Title not found.", ephemeral=True)
+        return
+
+    # Delete title and all references
+    c.execute("DELETE FROM titles WHERE id = ?", (title_id,))
+    c.execute("DELETE FROM user_titles_multi WHERE title_id = ?", (title_id,))
+    c.execute("DELETE FROM user_equipped_titles WHERE title_id = ?", (title_id,))
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"🗑️ Removed title **{row[0]}** (ID {title_id}) from the shop.",
+        ephemeral=False
+    )
+
+
 
 # ------------------------------------------------------------
 # ADMIN COMMAND — Set someone’s streak
@@ -1423,15 +1459,16 @@ async def on_message(message: discord.Message):
 #                 DAILY REMINDER TASK (12 PM)
 # ============================================================
 
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=30)
 async def daily_reminder_task():
     now = now_cst()
-    target = now.replace(hour=12, minute=0, second=0, microsecond=0)
-    if now >= target and now < (target + timedelta(minutes=1)):
+    
+    if now.hour == 12 and now.minute == 0:  # exact 12:00
         for guild in bot.guilds:
             settings = get_settings(guild.id)
 
-            if settings["last_reminder_date"] == today_cst_str():
+            # Prevent duplicate reminders
+            if settings.get("last_reminder_date") == today_cst_str():
                 continue
 
             await send_reminder_message(guild)
@@ -1442,26 +1479,28 @@ async def daily_reminder_task():
 #                  MIDNIGHT SUMMARY TASK (12 AM)
 # ============================================================
 
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=30)
 async def midnight_task():
     now = now_cst()
-    today = today_cst_str()
 
-    # Midnight window: 00:00–00:04
-    if now.hour == 0 and now.minute < 5:
+    if now.hour == 0 and now.minute == 0:  # exact midnight
+        today = today_cst_str()
+
         for guild in bot.guilds:
             settings = get_settings(guild.id)
 
-            # Avoid repeating summary each night
             if settings.get("last_summary_date") == today:
                 continue
 
-            # Send summary + reset streaks
+            # send summary
             await send_summary_embed(guild)
+
+            # reset streaks
             reset_streaks_for_missed_yesterday(guild)
 
-            # Save last summary day
+            # mark as done
             upsert_settings(guild.id, last_summary_date=today)
+
 
 
 # ============================================================
@@ -1536,6 +1575,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
