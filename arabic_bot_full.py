@@ -20,6 +20,51 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
 # ---------------- CONFIG ----------------
+# ---------------- GLOBALS & CONFIG HELPERS ----------------
+# Challenge behavior
+CHALLENGE_TIMEOUT_SECONDS = 90
+CHALLENGE_SIM_THRESHOLD = 0.50
+POINTS_PER_CORRECT = 5
+
+# Admin helpers: set OWNER_IDS env var to a comma-separated list of Discord IDs,
+# or the code will fall back to username checks below.
+OWNER_IDS = "848935997358211122"
+_owner_env = os.getenv("OWNER_IDS", "")
+if _owner_env:
+    for part in _owner_env.split(","):
+        try:
+            OWNER_IDS.add(int(part.strip()))
+        except:
+            pass
+
+# A small set of username-based admin fallbacks (lowercase)
+ADMIN_USERNAMES = {"baja1121", "baja", "justin", "justin baja"}
+
+# In-memory caches to make scoring fast and non-blocking
+# struggle_embedding_cache: struggle_id -> numpy array (float32)
+struggle_embedding_cache: dict = {}
+# also cache struggle metadata (optional): struggle_id -> (guild_id, user_id, word, definition)
+struggle_meta_cache: dict = {}
+# active_challenges: maps user_id -> dict with keys: struggle_id, definition, word, expires_at (datetime)
+active_challenges = {}
+# small in-memory lock to avoid race conditions
+_active_challenge_lock = asyncio.Lock()
+
+# Helper: check admin membership for interaction/member
+def is_member_admin(member: discord.Member):
+    if not member:
+        return False
+    if member.id in OWNER_IDS:
+        return True
+    uname = str(member).split("#")[0].lower()
+    if uname in ADMIN_USERNAMES:
+        return True
+    # check guild perms as fallback
+    try:
+        return member.guild_permissions.administrator
+    except:
+        return False
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 TIMEZONE = ZoneInfo("America/Chicago")
 REMINDER_HOUR = 12  # 12:00 PM CST
@@ -259,7 +304,10 @@ def reset_streaks_for_missed_yesterday(guild: discord.Guild):
 # ----------------------------------------
 
 def embed_text(text: str) -> bytes:
-    """Generate embedding bytes from text."""
+    """Generate embedding bytes from text.
+
+    Note: keep behavior same (returns bytes) — caller must store in DB.
+    """
     vec = embedding_model.encode(text)
     arr = np.asarray(vec, dtype=np.float32)
     return arr.tobytes()
@@ -269,25 +317,37 @@ def get_embedding_array(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
 
 def add_struggle_word(guild_id: int, user_id: int, word: str, definition: str):
-    """Insert a struggle word + its embedding."""
+    """Insert a struggle word + its embedding and cache it for faster scoring."""
+    word_l = word.lower()
+    def_l = definition.lower()
     try:
         c.execute("""
             INSERT INTO struggle_words (guild_id, user_id, word, definition)
             VALUES (?, ?, ?, ?)
-        """, (guild_id, user_id, word.lower(), definition.lower()))
+        """, (guild_id, user_id, word_l, def_l))
         conn.commit()
     except sqlite3.IntegrityError:
         return False
 
     # Insert embedding
     struggle_id = c.lastrowid
-    emb = embed_text(definition)
+    emb_bytes = embed_text(definition)
     c.execute("""
         INSERT INTO struggle_embeddings (struggle_id, embedding)
         VALUES (?, ?)
-    """, (struggle_id, emb))
+    """, (struggle_id, emb_bytes))
     conn.commit()
+
+    # Cache embedding and meta
+    try:
+        arr = np.frombuffer(emb_bytes, dtype=np.float32)
+        struggle_embedding_cache[int(struggle_id)] = arr
+        struggle_meta_cache[int(struggle_id)] = (int(guild_id), int(user_id), word_l, def_l)
+    except Exception:
+        pass
+
     return True
+
 
 def remove_struggle_word(guild_id: int, user_id: int, word: str):
     """Remove struggle word."""
@@ -312,30 +372,56 @@ def get_user_struggle_words(guild_id: int, user_id: int):
     """, (guild_id, user_id))
     return c.fetchall()
 
+# Keep a tiny per-user last-served memory to avoid immediate repeats
+_user_last_word = {}
+
 def get_random_struggle_word(guild_id: int, user_id: int):
     rows = get_user_struggle_words(guild_id, user_id)
-    return random.choice(rows) if rows else None
+    if not rows:
+        return None
+    # rows is list of (id, word, definition)
+    if len(rows) == 1:
+        _user_last_word[user_id] = rows[0][0]
+        return rows[0]
+    # Prefer a different word than last served
+    last_id = _user_last_word.get(user_id)
+    choices = [r for r in rows if r[0] != last_id]
+    choice = random.choice(choices) if choices else random.choice(rows)
+    _user_last_word[user_id] = choice[0]
+    return choice
+
 
 def evaluate_answer(user_answer: str, correct_definition: str, struggle_id: int):
     """
     Compare embeddings of the correct definition vs. user's answer.
     Returns similarity (0 to ~1).
+    This is CPU-bound; call via asyncio.to_thread() for non-blocking behavior.
     """
-    # Fetch stored embedding
-    c.execute("SELECT embedding FROM struggle_embeddings WHERE struggle_id = ?", (struggle_id,))
-    row = c.fetchone()
-    if not row:
-        return 0.0
+    # Try cache first
+    stored_vec = struggle_embedding_cache.get(int(struggle_id))
+    if stored_vec is None:
+        # Fallback to DB read and then cache
+        c.execute("SELECT embedding FROM struggle_embeddings WHERE struggle_id = ?", (struggle_id,))
+        row = c.fetchone()
+        if not row:
+            return 0.0
+        try:
+            stored_vec = get_embedding_array(row[0])
+            struggle_embedding_cache[int(struggle_id)] = stored_vec
+        except Exception:
+            return 0.0
 
-    stored_vec = get_embedding_array(row[0])
-
-    # Embed user's answer
+    # Embed user's answer (this is the expensive step)
     ans_vec = embedding_model.encode(user_answer)
     ans_vec = np.asarray(ans_vec, dtype=np.float32)
 
+    # cosine_similarity expects 2D arrays
     sim = cosine_similarity([stored_vec], [ans_vec])[0][0]
+    # clamp to [0,1] for safety
+    if sim != sim:  # NaN guard
+        return 0.0
+    return float(max(0.0, min(1.0, sim)))
 
-    return sim
 
 async def send_reminder_message(guild: discord.Guild):
     settings = get_settings(guild.id)
@@ -563,46 +649,71 @@ async def struggle_list(interaction: discord.Interaction):
         )
         return
 
-    msg = "**Your Struggle Words:**\n\n"
+    # PATCH 9: Embed to avoid message length errors
+    embed = discord.Embed(
+        title="📘 Your Struggle Words",
+        description="Here are your saved words and definitions:",
+        color=discord.Color.blue()
+    )
+
     for _, word, definition in rows:
-        msg += f"• **{word}** → `{definition}`\n"
+        embed.add_field(
+            name=word,
+            value=definition if definition else "*No definition*",
+            inline=False
+        )
 
-    await interaction.response.send_message(msg, ephemeral=True)
-
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ------------------------------------------------------------
 # /challenge — gives a random struggle word & waits for answer
 # ------------------------------------------------------------
 
-active_challenges = {}  # key: user_id, value: (struggle_id, correct_def)
-
+# active_challenges defined earlier at top-level (reused)
 @tree.command(name="challenge", description="Get quizzed on one of your struggle words.")
 async def challenge(interaction: discord.Interaction):
     guild_id = interaction.guild_id
-    user_id = interaction.user.id
+    user = interaction.user
+    user_id = user.id
 
-    row = get_random_struggle_word(guild_id, user_id)
-    if not row:
-        await interaction.response.send_message(
-            "❌ You have no struggle words. Add some first.",
-            ephemeral=True
-        )
-        return
+    # Prevent multiple active challenges for same user
+    async with _active_challenge_lock:
+        if user_id in active_challenges:
+            await interaction.response.send_message(
+                "⏳ You already have an active challenge. Answer it or wait for it to expire.",
+                ephemeral=True
+            )
+            return
 
-    struggle_id, word, definition = row
+        row = get_random_struggle_word(guild_id, user_id)
+        if not row:
+            await interaction.response.send_message(
+                "❌ You have no struggle words. Add some first.",
+                ephemeral=True
+            )
+            return
 
-    active_challenges[user_id] = (struggle_id, definition)
+        struggle_id, word, definition = row
+        expires = now_cst() + timedelta(seconds=CHALLENGE_TIMEOUT_SECONDS)
+        active_challenges[user_id] = {
+            "struggle_id": int(struggle_id),
+            "definition": definition,
+            "word": word,
+            "expires_at": expires
+        }
 
+    # Immediate response so Discord doesn't mark "application did not respond"
     await interaction.response.send_message(
-        f"🧠 **Challenge Time!**\n\nWhat is the definition of:\n\n👉 **{word}** ?\n\nType your answer in chat.",
+        f"🧠 **Challenge Time!**\n\nWhat is the definition of:\n\n👉 **{word}** ?\n\nType your answer in chat. You have {CHALLENGE_TIMEOUT_SECONDS} seconds.",
         ephemeral=False
     )
 
 
 
+
 # ------------------------------------------------------------
-# /points — see your points
+# /points — see your points (PATCH 10)
 # ------------------------------------------------------------
 
 @tree.command(name="points", description="Check your points.")
@@ -610,11 +721,17 @@ async def points_cmd(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     user_id = interaction.user.id
 
-    pts = get_points(guild_id, user_id)
-    await interaction.response.send_message(
-        f"⭐ You have **{pts}** points.",
-        ephemeral=True
+    # PATCH 10: thread-safe DB fetch to avoid race conditions
+    pts = await asyncio.to_thread(get_points, guild_id, user_id)
+
+    embed = discord.Embed(
+        title="⭐ Your Points",
+        description=f"You currently have **{pts}** points.",
+        color=discord.Color.gold()
     )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 
 # ------------------------------------------------------------
@@ -626,16 +743,16 @@ async def shop_cmd(interaction: discord.Interaction):
     rows = list_titles()
     if not rows:
         await interaction.response.send_message(
-            "Shop is empty.",
+            "Shop is empty. Admins can add titles with `create_title` (or set OWNER_IDS environment).",
             ephemeral=True
         )
         return
 
-    msg = "**🏪 TITLE SHOP:**\n\n"
+    embed = discord.Embed(title="🏪 Title Shop", description="Available titles", color=0x00B2FF)
     for tid, name, color, price in rows:
-        msg += f"• **[{name}]** — `{color}` — **{price} pts** (id: `{tid}`)\n"
+        embed.add_field(name=f"[{name}] — {price} pts", value=f"Color: `{color}` — id: `{tid}`", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    await interaction.response.send_message(msg, ephemeral=True)
 
 
 # ------------------------------------------------------------
@@ -663,16 +780,21 @@ async def buy_title(interaction: discord.Interaction, title_id: int):
     row = c.fetchone()
     name, color = row
 
-    try:
-        await apply_title_color(interaction.guild.get_member(user.id), color, name)
-    except Exception as e:
-        await interaction.response.send_message(f"⚠️ Title purchased but color assignment failed.", ephemeral=True)
+        try:
+        member = interaction.guild.get_member(user.id)
+        # guard: sometimes member can be None
+        if member is None:
+            member = await interaction.guild.fetch_member(user.id)
+        await apply_title_color(member, color, name)
+    except Exception:
+        await interaction.response.send_message(f"⚠️ Title purchased but color assignment failed (role creation/assignment).", ephemeral=True)
         return
 
     await interaction.response.send_message(
         f"🎉 You bought the title **[{name}]**!",
         ephemeral=False
     )
+
 
 
 # ------------------------------------------------------------
@@ -766,30 +888,63 @@ async def on_message(message: discord.Message):
     user_id = message.author.id
     guild_id = message.guild.id if message.guild else None
 
-    # Check if user is in an active challenge
-    if user_id in active_challenges:
-        struggle_id, correct_definition = active_challenges[user_id]
-
-        user_answer = message.content.strip()
-
-        # USE THE REAL FUNCTION
-        score = evaluate_answer(user_answer, correct_definition, struggle_id)
-
-        if score >= 0.5:
-            add_points(guild_id, user_id, 5)
-            del active_challenges[user_id]
-
-            await message.channel.send(
-                f"🔥 **Correct!** You earned **5 points!**\n"
-                f"Similarity score: `{score:.2f}`"
-            )
+    # Only proceed if this user currently has a challenge
+    chal = active_challenges.get(user_id)
+    if chal:
+        # Check expiry
+        if now_cst() > chal["expires_at"]:
+            # expired: remove and inform
+            async with _active_challenge_lock:
+                if user_id in active_challenges:
+                    del active_challenges[user_id]
+            try:
+                await message.channel.send(f"⌛ Challenge expired. Run `/challenge` to get a new one.")
+            except:
+                pass
         else:
-            await message.channel.send(
-                f"❌ Not quite. Try again!\n"
-                f"Similarity score: `{score:.2f}`"
-            )
+            user_answer = message.content.strip()
+            struggle_id = int(chal["struggle_id"])
+            correct_definition = chal["definition"]
+            # Evaluate in a thread so the event loop isn't blocked
+            try:
+                score = await asyncio.to_thread(evaluate_answer, user_answer, correct_definition, struggle_id)
+            except Exception as e:
+                # On error, remove challenge and notify
+                async with _active_challenge_lock:
+                    if user_id in active_challenges:
+                        del active_challenges[user_id]
+                await message.channel.send("⚠️ Error evaluating your answer. Try `/challenge` again.")
+                await bot.process_commands(message)
+                return
 
+            # Single attempt policy: correct -> award & close; wrong -> reveal & close
+            if score >= CHALLENGE_SIM_THRESHOLD:
+                add_points(guild_id, user_id, POINTS_PER_CORRECT)
+                async with _active_challenge_lock:
+                    if user_id in active_challenges:
+                        del active_challenges[user_id]
+                await message.channel.send(
+                    f"🔥 **Correct!** You earned **{POINTS_PER_CORRECT} points!**\n"
+                    f"Similarity score: `{score:.2f}`"
+                )
+            else:
+                # reveal the expected answer and close challenge
+                async with _active_challenge_lock:
+                    if user_id in active_challenges:
+                        expected = active_challenges[user_id]["definition"]
+                        word_txt = active_challenges[user_id].get("word", "")
+                        del active_challenges[user_id]
+                    else:
+                        expected = correct_definition
+                        word_txt = chal.get("word", "")
+                await message.channel.send(
+                    f"❌ Not quite. The correct answer for **{word_txt}** was:\n`{expected}`\n"
+                    f"Similarity score: `{score:.2f}`\nRun `/challenge` to try another."
+                )
+
+    # allow other commands to be processed
     await bot.process_commands(message)
+
 
 
 
@@ -828,31 +983,60 @@ async def midnight_task():
 
         await asyncio.sleep(60)  # prevent double firing
 
+@tasks.loop(seconds=10)
+async def _challenge_sweeper():
+    """Remove expired challenges to keep memory clean and notify channels if needed."""
+    now = now_cst()
+    to_remove = []
+    async with _active_challenge_lock:
+        for uid, chal in list(active_challenges.items()):
+            if now > chal["expires_at"]:
+                to_remove.append(uid)
+        for uid in to_remove:
+            try:
+                del active_challenges[uid]
+            except KeyError:
+                pass
+    # No channel notification here; on_message notifies the user when they next message.
+
 
 # ============================================================
-#                          ON READY
+#                          ON READY (PATCHED)
 # ============================================================
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
-    # Sync commands
+    # PATCH 1: Pre-sync to avoid "Application did not respond"
+    try:
+        cmds = await tree.sync()
+        print(f"Pre-synced {len(cmds)} commands successfully.")
+    except Exception as e:
+        print("Pre-sync error:", e)
+
+    # Normal sync
     try:
         await tree.sync()
         print("Slash commands synced.")
     except Exception as e:
         print("Sync error:", e)
 
-    # Start tasks
-    try:
-        if not daily_reminder_task.is_running():
-            daily_reminder_task.start()
+# Start tasks
+try:
+    if not daily_reminder_task.is_running():
+        daily_reminder_task.start()
 
-        if not midnight_task.is_running():
-            midnight_task.start()
-    except Exception as e:
-        print("Task start error:", e)
+    if not midnight_task.is_running():
+        midnight_task.start()
+
+    # PATCH: Start the challenge sweeper (runs every 10 seconds)
+    if not _challenge_sweeper.is_running():
+        _challenge_sweeper.start()
+
+except Exception as e:
+    print("Task start error:", e)
+
 
     print("Bot is fully ready.")
 
@@ -867,5 +1051,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
