@@ -1041,41 +1041,37 @@ async def set_streak_cmd(interaction: discord.Interaction, user: discord.Member,
     )
 
 # ------------------------------------------------------------
-# ADMIN — Give streak freezes
+# ADMIN: GIVE STREAK FREEZE
 # ------------------------------------------------------------
-@tree.command(name="give_freeze", description="ADMIN: Give a user streak freezes.")
-@app_commands.describe(user="User to give freezes to", amount="Amount to give")
+@tree.command(name="give_freeze", description="Admin: give a user streak freezes.")
 async def give_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
 
-    if str(interaction.user.id) != OWNER_IDS:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+    if str(interaction.user.id) not in OWNER_IDS:
+        await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
         return
 
     add_freeze(interaction.guild_id, user.id, amount)
     await interaction.response.send_message(
-        f"🧊 Gave **{amount}** streak freezes to **{user.display_name}**.",
+        f"✅ Gave **{amount}** streak freeze(s) to **{user.display_name}**.",
         ephemeral=True
     )
 
 
 # ------------------------------------------------------------
-# ADMIN — Set streak freezes
+# ADMIN: SET STREAK FREEZE
 # ------------------------------------------------------------
-@tree.command(name="set_freeze", description="ADMIN: Set exact freeze amount.")
-@app_commands.describe(user="User", amount="New amount")
+@tree.command(name="set_freeze", description="Admin: set a user's streak freezes.")
 async def set_freeze_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
 
-    if str(interaction.user.id) != OWNER_IDS:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+    if str(interaction.user.id) not in OWNER_IDS:
+        await interaction.response.send_message("❌ You are not authorized.", ephemeral=True)
         return
 
-    set_freeze(interaction.guild_id, user.id, amount)
+    set_user_freeze(interaction.guild_id, user.id, amount)
     await interaction.response.send_message(
-        f"🧊 Set **{user.display_name}**'s streak freezes to **{amount}**.",
+        f"✅ Set **{user.display_name}** to **{amount}** streak freezes.",
         ephemeral=True
     )
-
-
 
 # ------------------------------------------------------------
 # /buy_title — purchase a title by ID
@@ -1727,6 +1723,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
