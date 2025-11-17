@@ -1491,25 +1491,28 @@ async def daily_reminder_task():
 
 
 # ============================================================
-#                  MIDNIGHT SUMMARY TASK (12 AM)
+#                  MIDNIGHT SUMMARY TASK (11 PM)
 # ============================================================
 
 @tasks.loop(seconds=30)
 async def midnight_task():
     now = datetime.now(cst)
-    today = now.strftime("%Y-%m-%d")
 
-    if now.hour == 0 and now.minute == 0:
+    # 'today' refers to the date being summarized (yesterday at 11PM)
+    summary_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if now.hour == 23 and now.minute == 0:
         for guild in bot.guilds:
             settings = get_settings(guild.id)
 
-            if settings.get("last_summary_date") == today:
+            if settings.get("last_summary_date") == summary_date:
                 continue
 
             await send_summary_embed(guild)
             reset_streaks_for_missed_yesterday(guild)
 
-            upsert_settings(guild.id, last_summary_date=today)
+            upsert_settings(guild.id, last_summary_date=summary_date)
+
 
 # ============================================================
 #                CHALLENGE SWEEPER (unchanged)
@@ -1583,6 +1586,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
